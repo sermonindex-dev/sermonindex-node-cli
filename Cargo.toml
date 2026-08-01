@@ -1,0 +1,56 @@
+[package]
+name = "sermonindex-node"
+version = "0.2.0"
+edition = "2021"
+description = "SermonIndex headless seed node — download, hold, and seed the sermon archive with an optional built-in dashboard."
+authors = ["SermonIndex"]
+rust-version = "1.85"
+
+[[bin]]
+name = "sermonindex-node"
+path = "src/main.rs"
+
+[features]
+default = ["seed"]
+# BitTorrent seeding via librqbit. Turn OFF (--no-default-features) for a
+# download-and-hold node, or for a fast build on constrained machines.
+seed = ["dep:librqbit"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "io-util", "signal", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = "2"
+base64 = "0.22"
+hex = "0.4"
+dirs = "5"
+anyhow = "1"
+sysinfo = "0.32"
+futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# BitTorrent engine — same one the desktop app uses (optional, feature "seed").
+librqbit = { version = "9.0.0-rc.0", optional = true }
+
+# ── Static OpenSSL, musl targets only ────────────────────────────────────────
+# We ask reqwest for rustls with no default features, but librqbit pulls reqwest
+# WITH its defaults (native-tls) and also depends on crypto-hash — and Cargo
+# unifies features across the whole graph, so openssl-sys lands in the build
+# whether we want it or not. On a musl target there is no system OpenSSL to link
+# against, so the build fails unless we bring our own.
+#
+# "vendored" compiles OpenSSL from source and links it statically. That is what
+# makes the published Linux binaries genuinely self-contained: no libssl, no
+# libc, nothing to install on a NAS. It costs a few minutes of build time, which
+# is CI's problem and not a user's. Gated to musl so everyday macOS/glibc dev
+# builds stay fast and keep using the system library.
+[target.'cfg(target_env = "musl")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
+# Vendored librqbit with ONE change: the per-torrent discovered-peer map is
+# bounded (see vendor/librqbit/src/torrent_state/live/peers/mod.rs). Upstream
+# never caps or prunes it, which makes a 25,000-torrent seed run out of memory.
+# Re-apply this patch when upgrading librqbit.
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }

@@ -1,0 +1,389 @@
+//! Configuration, the ~/.sermonindex data directory, and node identity.
+//! Layout and formats are byte-compatible with the desktop app so the two can
+//! share a data dir (settings.json, catalog.json, download-state.json, downloads/).
+
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+
+pub const LISTEN_PORT_START: u16 = 42800;
+pub const LISTEN_PORT_END: u16 = 42839; // inclusive, matches the app
+pub const DASHBOARD_PORT: u16 = 8137;
+pub const API_BASE: &str = "https://app.sermonindex.net";
+/// Reachability probe edge (server/network-edge-script.js) — TCP-dials this node
+/// back over IPv4 and IPv6 so it can self-report `reachable`, exactly like the
+/// desktop app's `probeReachability()`.
+pub const PROBE_API: &str = "https://app-endpoints-gkb5p.bunny.run";
+pub const MASTER_LIST_URL: &str = "https://sermonindex1.b-cdn.net/torrents/master-list.json";
+pub const APP_VERSION: &str = concat!("cli-", env!("CARGO_PKG_VERSION"));
+
+/// ~/.sermonindex (same dir the desktop app uses).
+pub fn data_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".sermonindex")
+}
+
+/// The downloads root — settings.json "storage_dir" if set, else <data>/downloads.
+pub fn downloads_dir(settings: &Value) -> PathBuf {
+    if let Some(s) = settings.get("storage_dir").and_then(|v| v.as_str()) {
+        if !s.trim().is_empty() {
+            return PathBuf::from(s);
+        }
+    }
+    data_dir().join("downloads")
+}
+
+pub fn torrents_dir() -> PathBuf {
+    data_dir().join("torrents")
+}
+
+/// Local 2-char shard for a file — copied verbatim from the app's `shard_for`
+/// so files land in the same place and stay reusable across app and CLI.
+pub fn shard_for(filename: &str) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    let mut chars = stem.chars().filter(|c| c.is_ascii_alphanumeric());
+    let a = chars.next().unwrap_or('0').to_ascii_lowercase();
+    let b = chars.next().unwrap_or('0').to_ascii_lowercase();
+    format!("{a}{b}")
+}
+
+/// Absolute on-disk path for a canonical file name like "gGl7g6A_0WI-IeZJ.mp3".
+pub fn file_path(settings: &Value, name: &str) -> PathBuf {
+    downloads_dir(settings).join(shard_for(name)).join(name)
+}
+
+fn settings_path() -> PathBuf {
+    data_dir().join("settings.json")
+}
+
+pub fn load_settings() -> Value {
+    match std::fs::read_to_string(settings_path()) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    }
+}
+
+/// Atomic settings write (temp file + rename), preserving existing keys.
+pub fn save_settings(settings: &Value) -> Result<()> {
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let tmp = dir.join("settings.json.part");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(settings)?)
+        .context("write settings.json.part")?;
+    std::fs::rename(&tmp, settings_path()).context("rename settings.json")?;
+    Ok(())
+}
+
+/// Return the persisted node_id, generating + saving a fresh one if absent.
+/// Format matches the app: "si-" + 16 random bytes hex.
+pub fn node_id(settings: &mut Value) -> String {
+    if let Some(id) = settings.get("node_id").and_then(|v| v.as_str()) {
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    let mut buf = [0u8; 16];
+    getrandom(&mut buf);
+    let id = format!("si-{}", hex::encode(buf));
+    settings["node_id"] = json!(id);
+    let _ = save_settings(settings);
+    id
+}
+
+/// The seed scope: "audio" (~400 GB) or "full" (~2.4 TB). Defaults to audio.
+pub fn seed_scope(settings: &Value) -> String {
+    settings
+        .get("seed_scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("audio")
+        .to_string()
+}
+
+/// Whether to join the BitTorrent DHT. Defaults to TRUE.
+///
+/// History worth keeping: DHT was briefly defaulted OFF because resident memory
+/// on a Pi holding ~25,500 torrents climbed ~0.5 GB/hour until the machine
+/// froze. Measured with src/bin/memtest.rs:
+///
+///   trackers only : 15.0 KB/torrent, flat over the sample window
+///   DHT only      : 11.7 KB/torrent and climbing continuously
+///
+/// The cause was never DHT itself — it was that peers discovered per torrent
+/// accumulated in a map librqbit never capped or pruned. Turning DHT off just
+/// slowed the fill while costing all peer discovery (the node dropped to zero
+/// peers). vendor/librqbit now bounds that map, so DHT is safe again and is
+/// back on by default. See max_peers_per_torrent().
+pub fn dht_enabled(settings: &Value) -> bool {
+    settings
+        .get("dht_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// How many DISCOVERED peer addresses each torrent will remember (default 64).
+///
+/// This is the knob that keeps memory bounded, and it is NOT the same as the
+/// number of peers connected — that is governed by librqbit's own per-torrent
+/// connection semaphore. This caps the map of *known candidate addresses*,
+/// which is what grew without limit and exhausted the Pi.
+///
+/// Set 0 to restore upstream behaviour (unbounded) — useful for A/B testing
+/// with memtest, not recommended in production on a small machine.
+pub fn max_peers_per_torrent(settings: &Value) -> usize {
+    settings
+        .get("max_peers_per_torrent")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(64) as usize
+}
+
+/// How many torrents are LIVE (announcing + serving) at once. Default 2000.
+///
+/// Why this exists: bringing all ~25,500 torrents live at once costs over 2 GB
+/// of resident memory before the node even reaches steady state — on the 4 GB
+/// Pi that meant a kernel OOM kill at the service's memory ceiling every ~10
+/// minutes, forever. The discovered-peer cap (max_peers_per_torrent) bounds
+/// growth over TIME but not that baseline. So the node keeps the whole library
+/// registered but PAUSED (a paused torrent keeps its verified pieces and costs
+/// ~6 KB) and rotates a window of this many live, advancing every
+/// rotate_minutes. A torrent with connected peers is never paused mid-transfer.
+///
+/// Set 0 to disable rotation and bring everything live — fine on machines with
+/// real RAM, exactly what melted the Pi. Nodes holding fewer files than the
+/// window are unaffected: everything stays live and rotation is a no-op.
+pub fn active_torrents(settings: &Value) -> usize {
+    settings
+        .get("active_torrents")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2000) as usize
+}
+
+/// Minutes each rotation window stays live before advancing (default 15,
+/// minimum 1). Time to cycle the full library ≈ ceil(total/active) × this —
+/// at the defaults on the full audio scope, ~13 windows ≈ 3¼ hours.
+pub fn rotate_minutes(settings: &Value) -> u64 {
+    settings
+        .get("rotate_minutes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(15)
+        .max(1)
+}
+
+// ── quiet hours ──────────────────────────────────────────────────────────────
+// Windows in LOCAL time when the node must not touch the network — e.g. Sunday
+// morning services and Wednesday-night meetings, so a church's livestream never
+// competes with the seed for upstream bandwidth. During a quiet window the node
+// pauses every torrent, refuses incoming handshakes (including wake-on-demand),
+// and holds off downloading; heartbeats and the dashboard stay up.
+//
+// settings.json (shared with the desktop app):
+//   "quiet_hours": [
+//     { "days": ["sun"], "start": "08:00", "end": "13:00" },
+//     { "days": ["wed"], "start": "18:00", "end": "21:30" }
+//   ]
+//
+// The GUI's simpler daily schedule (seed_schedule_enabled + seed_start/seed_end
+// — the hours seeding IS allowed, same every day) is honored too: outside that
+// window the node is quiet. Both can be used together.
+
+pub const DAY_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+#[derive(Clone, Debug)]
+pub struct QuietWindow {
+    pub days: u8,   // bitmask, bit 0 = Sunday … bit 6 = Saturday
+    pub start: u16, // minutes since local midnight
+    pub end: u16,   // end < start means the window crosses midnight
+}
+
+pub fn parse_hhmm(s: &str) -> Option<u16> {
+    let (h, m) = s.trim().split_once(':')?;
+    let (h, m): (u16, u16) = (h.parse().ok()?, m.parse().ok()?);
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
+/// "sun,wed" | "all" | "weekdays" | "weekend" → day bitmask.
+pub fn parse_days(spec: &str) -> Option<u8> {
+    match spec.trim().to_lowercase().as_str() {
+        "all" | "daily" | "everyday" => return Some(0x7f),
+        "weekdays" => return Some(0b0111110),
+        "weekend" | "weekends" => return Some(0b1000001),
+        _ => {}
+    }
+    let mut mask = 0u8;
+    for part in spec.split(',') {
+        let p = part.trim().to_lowercase();
+        // "sun", "sunday", "Sun" all match — compare on the first 3 ASCII chars.
+        let key = p.get(..3)?;
+        let i = DAY_NAMES.iter().position(|d| *d == key)?;
+        mask |= 1 << i;
+    }
+    if mask == 0 { None } else { Some(mask) }
+}
+
+pub fn days_label(mask: u8) -> String {
+    if mask == 0x7f {
+        return "every day".into();
+    }
+    DAY_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mask & (1 << i) != 0)
+        .map(|(_, d)| *d)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn fmt_min(m: u16) -> String {
+    format!("{:02}:{:02}", m / 60, m % 60)
+}
+
+pub fn window_label(w: &QuietWindow) -> String {
+    format!("{} {}–{}", days_label(w.days), fmt_min(w.start), fmt_min(w.end))
+}
+
+/// Parse settings "quiet_hours" — malformed entries are skipped, not fatal.
+pub fn quiet_windows(settings: &Value) -> Vec<QuietWindow> {
+    let mut out = Vec::new();
+    if let Some(arr) = settings.get("quiet_hours").and_then(|v| v.as_array()) {
+        for e in arr {
+            let days = match e.get("days") {
+                Some(Value::Array(ds)) => {
+                    let spec = ds
+                        .iter()
+                        .filter_map(|d| d.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    parse_days(&spec)
+                }
+                Some(Value::String(s)) => parse_days(s),
+                _ => Some(0x7f), // no days field = every day
+            };
+            let (days, start, end) = match (
+                days,
+                e.get("start").and_then(|v| v.as_str()).and_then(parse_hhmm),
+                e.get("end").and_then(|v| v.as_str()).and_then(parse_hhmm),
+            ) {
+                (Some(d), Some(s), Some(en)) if s != en => (d, s, en),
+                _ => continue,
+            };
+            out.push(QuietWindow { days, start, end });
+        }
+    }
+    out
+}
+
+/// The GUI's daily ACTIVE window, if enabled and sane.
+fn gui_active_window(settings: &Value) -> Option<(u16, u16)> {
+    let on = settings
+        .get("seed_schedule_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !on {
+        return None;
+    }
+    let s = settings.get("seed_start").and_then(|v| v.as_str()).and_then(parse_hhmm)?;
+    let e = settings.get("seed_end").and_then(|v| v.as_str()).and_then(parse_hhmm)?;
+    if s == e { None } else { Some((s, e)) }
+}
+
+fn in_quiet_window(w: &QuietWindow, dow: u8, cur: u16) -> bool {
+    if w.start < w.end {
+        w.days & (1 << dow) != 0 && cur >= w.start && cur < w.end
+    } else {
+        // Crosses midnight: tonight's part, or the spill-over from yesterday.
+        (w.days & (1 << dow) != 0 && cur >= w.start)
+            || (w.days & (1 << ((dow + 6) % 7)) != 0 && cur < w.end)
+    }
+}
+
+/// Is the node scheduled quiet right now (local time)? Returns the matching
+/// rule as a human label for logs, None when it should be running.
+pub fn quiet_now(settings: &Value) -> Option<String> {
+    use chrono::{Datelike, Local, Timelike};
+    let now = Local::now();
+    let dow = now.weekday().num_days_from_sunday() as u8;
+    let cur = (now.hour() * 60 + now.minute()) as u16;
+    for w in quiet_windows(settings) {
+        if in_quiet_window(&w, dow, cur) {
+            return Some(format!("quiet hours ({})", window_label(&w)));
+        }
+    }
+    if let Some((s, e)) = gui_active_window(settings) {
+        let active = if s < e { cur >= s && cur < e } else { cur >= s || cur < e };
+        if !active {
+            return Some(format!(
+                "outside daily seeding hours ({}–{}, GUI schedule)",
+                fmt_min(s),
+                fmt_min(e)
+            ));
+        }
+    }
+    None
+}
+
+/// One-line schedule summary for startup/status output.
+pub fn describe_quiet(settings: &Value) -> String {
+    let mut parts: Vec<String> = quiet_windows(settings).iter().map(window_label).collect();
+    if let Some((s, e)) = gui_active_window(settings) {
+        parts.push(format!("outside {}–{} daily (GUI)", fmt_min(s), fmt_min(e)));
+    }
+    if parts.is_empty() {
+        "none scheduled — running around the clock".into()
+    } else {
+        format!("quiet {}  (local time)", parts.join(", "))
+    }
+}
+
+/// Optional upload cap in bytes/sec (0/absent = unlimited).
+pub fn upload_limit_bps(settings: &Value) -> Option<u32> {
+    let enabled = settings
+        .get("upload_limit_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let kbps = settings
+        .get("upload_limit_kbps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if kbps <= 0.0 {
+        None
+    } else {
+        Some((kbps * 1024.0) as u32)
+    }
+}
+
+/// Minimal OS randomness without pulling the `rand` crate.
+fn getrandom(buf: &mut [u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        // Read EXACTLY buf.len() bytes — /dev/urandom is an infinite stream, so
+        // fs::read() would never stop (and OOM). Open + read_exact instead.
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            if f.read_exact(buf).is_ok() {
+                return;
+            }
+        }
+    }
+    // Fallback: mix a few entropy sources (only hit if /dev/urandom is unavailable).
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    let mut x = seed ^ (pid << 64) ^ 0x9E3779B97F4A7C15;
+    for b in buf.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = (x & 0xff) as u8;
+    }
+}

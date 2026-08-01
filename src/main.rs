@@ -1,0 +1,817 @@
+//! SermonIndex headless seed node.
+//!
+//! Downloads the archive (audio by default) from the signed master list, holds
+//! it, seeds it over BitTorrent (feature "seed"), heartbeats onto the live node
+//! map, and serves the 4-screen dashboard on :8137 — all with no GUI. Runs as a
+//! service on Linux / macOS / Windows and on a Raspberry Pi.
+
+mod config;
+mod dashboard;
+mod download;
+mod heartbeat;
+mod masterlist;
+mod net;
+mod state;
+mod system;
+#[cfg(feature = "seed")]
+mod seed;
+
+use anyhow::Result;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use state::Shared;
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("start");
+    match cmd {
+        "version" | "-V" | "--version" => {
+            println!("sermonindex-node {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        "help" | "-h" | "--help" => {
+            print_help();
+            Ok(())
+        }
+        "status" => run_status(),
+        "quiet" => run_quiet(&args),
+        "verify" => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_verify(&args))
+        }
+        "start" | "run" => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_daemon(&args))
+        }
+        other => {
+            eprintln!("unknown command: {other}\n");
+            print_help();
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        r#"sermonindex-node — headless SermonIndex seed node
+
+Downloads, verifies, holds, and SEEDS the SermonIndex archive over BitTorrent
+with no GUI, and serves a live dashboard. Runs as a 24/7 service on a Raspberry
+Pi, an old laptop, a NAS, or a server. Shares the ~/.sermonindex data directory
+with the desktop app.
+
+USAGE
+  sermonindex-node [COMMAND] [OPTIONS]
+
+COMMANDS
+  start        Download + seed + heartbeat + serve the dashboard (default).
+  status       Print node id, scope, paths, and cache state, then exit.
+  quiet        View or edit quiet hours — weekly times the node goes silent
+               (no seeding, serving, or downloading) so a church's livestream
+               keeps the bandwidth. Local time; the running node applies
+               changes within a minute, no restart needed.
+                 quiet                          show the schedule
+                 quiet add sun 08:00-13:00      Sunday mornings off
+                 quiet add wed 18:00-21:30      Wednesday evenings off
+                 quiet add sun,wed 08:00-13:00  several days at once
+                 quiet remove 2                 delete window 2 from the list
+                 quiet clear                    remove all quiet hours
+  verify       Audit the library against the signed master list (presence +
+               exact size for every file) and report coverage. Read-only.
+  version      Print the version.
+  help         Show this help (also: -h, --help).
+
+START OPTIONS
+  --scope <audio|full>   What to hold and seed:
+                           audio   ~400 GB  — every audio sermon (default)
+                           full    ~2.4 TB  — audio + video, a complete backup
+                         Falls back to settings.json "seed_scope", else audio.
+  --dir <path>           Library storage directory (overrides settings.json
+                         "storage_dir"). Point at a big drive, e.g. --dir /mnt/library.
+  --no-download          Don't fetch anything new; only seed what's on disk and
+                         serve the dashboard (a pure seeder / mirror).
+  --no-dashboard         Don't start the local dashboard web server.
+  --no-heartbeat         Don't announce to the network map (local / testing use).
+
+CONFIGURATION   (~/.sermonindex/settings.json — shared with the desktop app)
+  storage_dir            Absolute path to the library folder.
+  seed_scope             "audio" or "full".
+  upload_limit_enabled   true/false — cap the BitTorrent upload rate.
+  upload_limit_kbps      Upload cap in KB/s when enabled (0 = unlimited).
+  node_id                Auto-generated on first run ("si-" + 16 hex). Your stable
+                         identity on the node map — keep it.
+  quiet_hours            Weekly silence windows (see the quiet command), e.g.
+                         [{{"days":["sun"],"start":"08:00","end":"13:00"}}].
+  active_torrents        How many torrents seed at once (default 2000; 0 = all).
+                         The rest stay registered but paused, rotating in turn —
+                         this is what keeps a 25k-sermon node inside 4 GB of RAM.
+  rotate_minutes         Minutes per rotation window (default 15).
+
+PATHS
+  data dir     ~/.sermonindex
+  library      <storage_dir> or ~/.sermonindex/downloads   (files: <shard>/<id>.mp3)
+  master list  ~/.sermonindex/master-list.json   (verified, cached copy)
+  torrents     ~/.sermonindex/torrents
+  dashboard    ~/.sermonindex/dashboard.html     (optional — overrides the built-in UI)
+
+DASHBOARD
+  Served at http://localhost:8137/  (and http://<this-host-ip>:8137/ on your LAN).
+  Four screens: Map, Network, Stats, System. Open in any browser, or run a
+  full-screen kiosk on a small display. To customize it, drop your own HTML at
+  ~/.sermonindex/dashboard.html and restart — no rebuild needed.
+
+NETWORK / REACHABILITY
+  BitTorrent listens on TCP 42800-42839 (first free port), dual-stack (IPv4 +
+  IPv6), trying UPnP and NAT-PMP automatically. Every heartbeat the node asks the
+  SermonIndex probe server to TCP-connect back over both IPv4 and IPv6 and reports
+  the result, so the live map can classify it:
+    seed  (blue)   — the node admin has granted seed status AND it is reachable
+    node  (green)  — reachable from the internet (port open on IPv4 or IPv6)
+    peer  (yellow) — running but not reachable inbound
+  With native IPv6 (common on Telus, Starlink, most fibre) a node is reachable
+  with NO port-forward at all — the global IPv6 address is dialed directly. The
+  detected address is printed at startup. If you have only IPv4 behind NAT,
+  forward TCP 42800 to this host (or rely on UPnP/NAT-PMP) to show as a green node.
+  Seeding holds one open file per torrent, so a full library needs a high open-
+  file limit — the installed service sets LimitNOFILE; elsewhere raise ulimit -n.
+
+SERVICE   (Linux, after build-and-install.sh)
+  sudo systemctl status  sermonindex-node
+  sudo systemctl restart sermonindex-node
+  journalctl -u sermonindex-node -f            # live progress
+  sermonindex-node status                      # quick info
+
+EXAMPLES
+  sermonindex-node start
+  sermonindex-node start --scope full --dir /mnt/library
+  sermonindex-node start --no-download          # seed-only mirror
+  sermonindex-node status
+
+Every node running this appears on the live map and helps keep the archive
+permanent. More: https://sermonindex.net
+"#
+    );
+}
+
+/// `sermonindex-node quiet …` — view or edit the weekly quiet-hours schedule.
+/// The running daemon re-reads settings every minute, so changes apply without
+/// a restart.
+fn run_quiet(args: &[String]) -> Result<()> {
+    let mut settings = config::load_settings();
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+    let print_list = |settings: &serde_json::Value| {
+        let windows = config::quiet_windows(settings);
+        if windows.is_empty() {
+            println!("No quiet hours scheduled — the node runs around the clock.");
+        } else {
+            println!("Quiet hours (local time — node pauses all seeding/serving):");
+            for (i, w) in windows.iter().enumerate() {
+                println!("  {}. {}", i + 1, config::window_label(w));
+            }
+        }
+        match config::quiet_now(settings) {
+            Some(why) => println!("\nRight now: QUIET — {why}"),
+            None => println!("\nRight now: active"),
+        }
+    };
+    match sub {
+        "list" => {
+            print_list(&settings);
+            Ok(())
+        }
+        "add" => {
+            let (days_s, range_s) = match (args.get(3), args.get(4)) {
+                (Some(d), Some(r)) => (d.as_str(), r.as_str()),
+                _ => {
+                    eprintln!("usage: sermonindex-node quiet add <days> <start-end>");
+                    eprintln!("  e.g. sermonindex-node quiet add sun 08:00-13:00");
+                    eprintln!("       sermonindex-node quiet add wed 18:00-21:30");
+                    eprintln!("       sermonindex-node quiet add sun,wed 08:00-13:00");
+                    eprintln!("  days: sun,mon,tue,wed,thu,fri,sat | all | weekdays | weekend");
+                    std::process::exit(2);
+                }
+            };
+            let days = config::parse_days(days_s).unwrap_or_else(|| {
+                eprintln!("Unrecognized days: {days_s}  (use e.g. sun,wed or all)");
+                std::process::exit(2);
+            });
+            let (start, end) = match range_s.split_once('-') {
+                Some((a, b)) => match (config::parse_hhmm(a), config::parse_hhmm(b)) {
+                    (Some(a), Some(b)) if a != b => (a, b),
+                    _ => {
+                        eprintln!("Bad time range: {range_s}  (use HH:MM-HH:MM, 24-hour)");
+                        std::process::exit(2);
+                    }
+                },
+                None => {
+                    eprintln!("Bad time range: {range_s}  (use HH:MM-HH:MM, 24-hour)");
+                    std::process::exit(2);
+                }
+            };
+            let entry = serde_json::json!({
+                "days": config::DAY_NAMES
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| days & (1 << i) != 0)
+                    .map(|(_, d)| *d)
+                    .collect::<Vec<_>>(),
+                "start": format!("{:02}:{:02}", start / 60, start % 60),
+                "end": format!("{:02}:{:02}", end / 60, end % 60),
+            });
+            match settings.get_mut("quiet_hours") {
+                Some(serde_json::Value::Array(a)) => a.push(entry),
+                _ => settings["quiet_hours"] = serde_json::json!([entry]),
+            }
+            config::save_settings(&settings)?;
+            println!("Added. The running node picks this up within a minute.\n");
+            print_list(&settings);
+            Ok(())
+        }
+        "remove" | "rm" => {
+            let idx: usize = args
+                .get(3)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| {
+                    eprintln!("usage: sermonindex-node quiet remove <number>  (see: quiet list)");
+                    std::process::exit(2);
+                });
+            let removed = match settings.get_mut("quiet_hours") {
+                Some(serde_json::Value::Array(a)) if idx >= 1 && idx <= a.len() => {
+                    Some(a.remove(idx - 1))
+                }
+                _ => None,
+            };
+            match removed {
+                Some(_) => {
+                    config::save_settings(&settings)?;
+                    println!("Removed window {idx}.\n");
+                    print_list(&settings);
+                    Ok(())
+                }
+                None => {
+                    eprintln!("No quiet window number {idx} — run: sermonindex-node quiet list");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "clear" => {
+            settings["quiet_hours"] = serde_json::json!([]);
+            config::save_settings(&settings)?;
+            println!("All quiet hours removed — the node runs around the clock.");
+            Ok(())
+        }
+        other => {
+            eprintln!("unknown quiet subcommand: {other}  (use: list, add, remove, clear)");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn arg_value(args: &[String], key: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+fn run_status() -> Result<()> {
+    let mut settings = config::load_settings();
+    let id = config::node_id(&mut settings);
+    let scope = config::seed_scope(&settings);
+    println!("SermonIndex node");
+    println!("  node_id:    {id}");
+    println!("  scope:      {scope}");
+    println!("  data dir:   {}", config::data_dir().display());
+    println!("  storage:    {}", config::downloads_dir(&settings).display());
+    println!(
+        "  master list cache: {}",
+        if masterlist::has_cache() {
+            "present"
+        } else {
+            "none (will fetch on start)"
+        }
+    );
+    println!("  dashboard:  http://localhost:{}/", config::DASHBOARD_PORT);
+    println!("  quiet:      {}", config::describe_quiet(&settings));
+    if let Some(why) = config::quiet_now(&settings) {
+        println!("              QUIET RIGHT NOW — {why}");
+    }
+    Ok(())
+}
+
+/// Human-readable byte size (GiB/MiB) for reports.
+fn human_bytes(b: u64) -> String {
+    const GB: f64 = 1_073_741_824.0;
+    const MB: f64 = 1_048_576.0;
+    let f = b as f64;
+    if f >= GB {
+        format!("{:.1} GB", f / GB)
+    } else {
+        format!("{:.0} MB", f / MB)
+    }
+}
+
+/// `verify` — audit the on-disk library against the ed25519-signed master list:
+/// every in-scope file must be present at its EXACT signed byte size. This is the
+/// authoritative "do we have the complete archive?" check. Fast (stat only, no
+/// re-hash) and read-only — it never deletes or downloads anything.
+async fn run_verify(args: &[String]) -> Result<()> {
+    let mut settings = config::load_settings();
+    let _ = config::node_id(&mut settings);
+    if let Some(dir) = arg_value(args, "--dir") {
+        settings["storage_dir"] = serde_json::json!(dir);
+    }
+    let scope = arg_value(args, "--scope").unwrap_or_else(|| config::seed_scope(&settings));
+
+    let client = reqwest::Client::builder()
+        .user_agent(format!("sermonindex-node/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .build()?;
+    let ml = masterlist::fetch_verified(&client).await?;
+    println!(
+        "[verify] master list v{} — {} entries (ed25519 signature verified)",
+        ml.version,
+        ml.entries.len()
+    );
+
+    let want_audio = scope != "full";
+    let entries: Vec<&masterlist::Entry> = ml
+        .entries
+        .values()
+        .filter(|e| if want_audio { e.is_audio() } else { e.is_audio() || e.is_video() })
+        .collect();
+    let total = entries.len() as u64;
+
+    let (mut present, mut missing, mut wrong, mut have_bytes, mut want_bytes) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for e in &entries {
+        want_bytes += e.size;
+        let p = config::file_path(&settings, &e.name);
+        match std::fs::metadata(&p) {
+            Ok(m) if m.len() == e.size => {
+                present += 1;
+                have_bytes += e.size;
+            }
+            Ok(_) => wrong += 1, // present but wrong size → corrupt/partial
+            Err(_) => missing += 1,
+        }
+    }
+
+    let pct = if total > 0 { present as f64 / total as f64 * 100.0 } else { 0.0 };
+    println!("scope:                  {scope}  ({total} files, {} total)", human_bytes(want_bytes));
+    println!("present & correct size: {present}");
+    println!("missing:                {missing}");
+    println!("wrong size (corrupt):   {wrong}");
+    println!("on disk:                {}", human_bytes(have_bytes));
+    println!("coverage:               {pct:.2}%");
+    if missing == 0 && wrong == 0 {
+        println!("\n\u{2713} COMPLETE — every file is present at its exact signed size.");
+    } else {
+        println!(
+            "\n\u{2717} INCOMPLETE — run `sermonindex-node start` to fetch the {} remaining.",
+            missing + wrong
+        );
+    }
+    Ok(())
+}
+
+async fn run_daemon(args: &[String]) -> Result<()> {
+    let mut settings = config::load_settings();
+    let node_id = config::node_id(&mut settings);
+    if let Some(dir) = arg_value(args, "--dir") {
+        settings["storage_dir"] = serde_json::json!(dir);
+        let _ = config::save_settings(&settings);
+    }
+    let scope = arg_value(args, "--scope").unwrap_or_else(|| config::seed_scope(&settings));
+    let no_download = args.iter().any(|a| a == "--no-download");
+    let no_dashboard = args.iter().any(|a| a == "--no-dashboard");
+    let no_heartbeat =
+        args.iter().any(|a| a == "--no-heartbeat") || std::env::var("SI_NO_HEARTBEAT").is_ok();
+    let upload_bps = config::upload_limit_bps(&settings);
+
+    println!("SermonIndex node {} — scope={scope}", env!("CARGO_PKG_VERSION"));
+    println!("  node_id {node_id}");
+    println!("  storage {}", config::downloads_dir(&settings).display());
+    match net::global_ipv6() {
+        Some(v6) => println!(
+            "  reachable via IPv6 [{v6}]:{} — no port-forward needed (peers can reach this node directly)",
+            config::LISTEN_PORT_START
+        ),
+        // NOTE: this runs once at startup, and on many machines the DHCPv6
+        // lease has not arrived yet — so "none" here does NOT mean the host
+        // lacks IPv6 for the rest of the run. The heartbeat re-checks the
+        // address every beat. Word it so a stale line can't be misread as a
+        // standing fault (it cost real debugging time once).
+        None => println!(
+            "  no global IPv6 yet (re-checked every heartbeat; a DHCPv6 lease often\n  \
+             arrives just after boot). Until then peering needs IPv4 UPnP/NAT-PMP or\n  \
+             a forwarded TCP port {}",
+            config::LISTEN_PORT_START
+        ),
+    }
+
+    let shared = Arc::new(Shared::new(node_id.clone(), scope.clone()));
+
+    // Dashboard HTTP server (own OS thread).
+    if !no_dashboard {
+        let sh = shared.clone();
+        std::thread::spawn(move || dashboard::serve(sh));
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent(format!("sermonindex-node/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .build()?;
+
+    // ── local stats loop (2 s) ───────────────────────────────────────────────
+    {
+        let sh = shared.clone();
+        let storage = config::downloads_dir(&settings);
+        std::thread::spawn(move || {
+            let mut meter = system::Meter::new();
+            loop {
+                let snap = meter.sample(&storage);
+                sh.render(&snap);
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+    }
+
+    // ── network view loop (30 s) ─────────────────────────────────────────────
+    {
+        let sh = shared.clone();
+        let cl = client.clone();
+        let id = node_id.clone();
+        tokio::spawn(async move {
+            loop {
+                let (map, stats) = heartbeat::fetch_network(&cl).await;
+                // Only replace the cached view when the fetch actually returned
+                // nodes. A timed-out fetch (common while the download saturates
+                // the link) must NOT blank the tiles to zero — keep last good.
+                let has_nodes = map
+                    .get("nodes")
+                    .and_then(|v| v.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                if has_nodes {
+                    *sh.network.lock().unwrap() = state::build_network_view(&map, &stats, &id);
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    // ── heartbeat (5 min) + liveness ping (180 s) ────────────────────────────
+    if no_heartbeat {
+        println!("[heartbeat] disabled (--no-heartbeat)");
+    } else {
+        let sh = shared.clone();
+        let cl = client.clone();
+        tokio::spawn(async move {
+            let geo = heartbeat::geo(&cl).await;
+            loop {
+                // Self-test inbound reachability (IPv4 + IPv6) the same way the
+                // desktop app does, then report it so the map can classify this
+                // node green/blue (reachable) vs yellow (peer).
+                let reachable =
+                    heartbeat::probe_reachability(&cl, config::LISTEN_PORT_START).await;
+                sh.set_reachable(reachable);
+                // Blue ONLY when the node admin has granted this node seed status
+                // (seed_access.enabled). We must keep reporting it each beat or the
+                // server upsert reverts node_type to "user".
+                let granted = heartbeat::check_seed_access(&cl, &sh.node_id).await;
+                sh.set_granted(granted);
+                heartbeat::beat(&cl, &sh, &geo, reachable, granted).await;
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+        });
+        let cl = client.clone();
+        let id = node_id.clone();
+        tokio::spawn(async move {
+            loop {
+                heartbeat::ping(&cl, &id).await;
+                tokio::time::sleep(Duration::from_secs(180)).await;
+            }
+        });
+    }
+
+    // ── master list ──────────────────────────────────────────────────────────
+    let ml = masterlist::fetch_verified(&client).await?;
+    println!("[masterlist] verified v{} — {} entries", ml.version, ml.entries.len());
+    let want_audio = scope != "full";
+    let entries: Vec<masterlist::Entry> = ml
+        .entries
+        .values()
+        .filter(|e| if want_audio { e.is_audio() } else { e.is_audio() || e.is_video() })
+        .cloned()
+        .collect();
+    shared.total.store(entries.len() as u64, Ordering::Relaxed);
+    println!("[scope] {} files in scope", entries.len());
+
+    // Count what's already present, and (with seeding) start seeding it.
+    // The bound lives inside the vendored librqbit, which reads it from the
+    // environment — set it before any session is created so the OnceLock inside
+    // picks up the configured value rather than the built-in default.
+    let max_peers = config::max_peers_per_torrent(&settings);
+    std::env::set_var("SI_MAX_PEERS_PER_TORRENT", max_peers.to_string());
+    let dht = config::dht_enabled(&settings);
+    println!(
+        "  peers   max {} discovered per torrent{}",
+        max_peers,
+        if max_peers == 0 { " (UNBOUNDED — upstream behaviour)" } else { "" }
+    );
+    println!("  dht     {}", if dht { "on" } else { "off — trackers only (fewer peers found)" });
+    // Rotation keeps memory flat regardless of library size: the full library
+    // stays registered (paused = ~6 KB each) while only a window is live.
+    let rotate_window = config::active_torrents(&settings);
+    let rotate_mins = config::rotate_minutes(&settings);
+    if rotate_window > 0 && entries.len() > rotate_window {
+        let cycles = entries.len().div_ceil(rotate_window);
+        println!(
+            "  rotate  {rotate_window} torrents live at a time, advancing every {rotate_mins} min \
+             (full library ≈ every {:.1} h)",
+            (cycles as f64 * rotate_mins as f64) / 60.0
+        );
+    } else if rotate_window > 0 {
+        println!("  rotate  library fits the {rotate_window}-torrent window — everything stays live");
+    } else {
+        println!("  rotate  off — every torrent live at once (active_torrents=0)");
+    }
+    println!("  quiet   {}", config::describe_quiet(&settings));
+    #[cfg(feature = "seed")]
+    let seeder = match seed::Seeder::start(&config::downloads_dir(&settings), upload_bps, dht).await {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            eprintln!("[seed] disabled — could not start session: {e:#}");
+            None
+        }
+    };
+    #[cfg(not(feature = "seed"))]
+    let _ = upload_bps;
+
+    let torrents_dir = config::torrents_dir();
+    let _ = &torrents_dir; // used only under the "seed" feature
+    let mut dl_state = state::load_download_state();
+    // (path, master-list info_hash) — the hash lets seed_file reuse its cached
+    // .torrent instead of re-hashing the whole file on every startup.
+    let mut present_paths: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut present = 0u64;
+    let mut present_bytes = 0u64;
+    for e in &entries {
+        let p = config::file_path(&settings, &e.name);
+        if std::fs::metadata(&p).map(|m| m.len() == e.size).unwrap_or(false) {
+            present += 1;
+            present_bytes += e.size;
+            shared.held.store(present, Ordering::Relaxed); // report immediately while scanning
+            // Keep the reported storage in step with the count as the scan runs,
+            // so an early heartbeat during a long scan is never wildly low.
+            shared.storage_bytes.store(present_bytes, Ordering::Relaxed);
+            dl_state[e.id()] = serde_json::json!({ "downloaded": true, "diskSize": e.size });
+            present_paths.push((p, e.info_hash.clone()));
+        }
+    }
+    state::save_download_state(&dl_state);
+    println!("[library] {present}/{} already held ({:.1}% coverage)", entries.len(), shared.coverage_pct());
+
+    // Register the already-present files for seeding in the BACKGROUND — re-hashing
+    // thousands of files is slow and must not block the held count or downloads.
+    #[cfg(feature = "seed")]
+    let rotate_on = rotate_window > 0;
+    #[cfg(feature = "seed")]
+    if let Some(s) = seeder.clone() {
+        let td = torrents_dir.clone();
+        tokio::spawn(async move {
+            // With rotation on, register everything PAUSED — near-zero live
+            // state — and let the rotation task decide what is live. Without
+            // it, go live immediately (the old behaviour).
+            for (p, ih) in present_paths {
+                let _ = s.seed_file(&p, &td, Some(&ih), rotate_on).await;
+            }
+            println!("[seed] finished registering {} held files for seeding", s.torrent_count());
+        });
+    }
+
+    // ── quiet-hours supervisor ───────────────────────────────────────────────
+    // Checks the schedule every minute, re-reading settings.json from disk so
+    // `sermonindex-node quiet add …` (or a GUI edit — the file is shared)
+    // applies without a restart. While quiet: every torrent paused, incoming
+    // handshakes refused (wake-on-demand gated off), downloads held. The
+    // re-pause repeats each minute so nothing that slipped live mid-transition
+    // stays live. Heartbeats and the dashboard keep running.
+    #[cfg(feature = "seed")]
+    {
+        let sh = shared.clone();
+        let sd = seeder.clone();
+        tokio::spawn(async move {
+            let mut was_quiet = false;
+            loop {
+                let s = config::load_settings();
+                let why = config::quiet_now(&s);
+                let quiet = why.is_some();
+                if quiet {
+                    librqbit::SI_ACCEPT_INCOMING.store(false, Ordering::Relaxed);
+                    sh.quiet.store(true, Ordering::Relaxed);
+                    if let Some(sd) = &sd {
+                        let n = sd.pause_all().await;
+                        if !was_quiet {
+                            println!(
+                                "[quiet] {} — paused {n} torrents; seeding, serving and downloads suspended",
+                                why.unwrap_or_default()
+                            );
+                        }
+                    }
+                } else {
+                    librqbit::SI_ACCEPT_INCOMING.store(true, Ordering::Relaxed);
+                    sh.quiet.store(false, Ordering::Relaxed);
+                    if was_quiet {
+                        println!("[quiet] window ended — resuming normal operation");
+                    }
+                }
+                was_quiet = quiet;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    #[cfg(not(feature = "seed"))]
+    {
+        // Download-only build: same schedule, gating just the fetch loop.
+        let sh = shared.clone();
+        tokio::spawn(async move {
+            let mut was_quiet = false;
+            loop {
+                let s = config::load_settings();
+                let quiet = config::quiet_now(&s).is_some();
+                if quiet != was_quiet {
+                    println!(
+                        "[quiet] {}",
+                        if quiet { "quiet hours — downloads suspended" } else { "window ended — resuming" }
+                    );
+                    was_quiet = quiet;
+                }
+                sh.quiet.store(quiet, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    // ── rotation task ────────────────────────────────────────────────────────
+    // Advances the live window through the library every rotate_minutes. Runs
+    // from the start so early-registered torrents begin seeding while the
+    // (long) registration pass is still working through the rest.
+    #[cfg(feature = "seed")]
+    if let Some(s) = seeder.clone() {
+        if rotate_on {
+            let dwell = Duration::from_secs(rotate_mins * 60);
+            // Stagger the starting window by node id so a fleet of nodes never
+            // sweeps the library in lockstep (all announcing the SAME window —
+            // the worst case for coverage). The id hash spreads cursors across
+            // the range; rotate_tick reduces it mod the library size.
+            let stagger = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                node_id.hash(&mut h);
+                h.finish() as usize
+            };
+            let sh = shared.clone();
+            tokio::spawn(async move {
+                let mut cursor = stagger;
+                let mut last_tick: Option<std::time::Instant> = None;
+                loop {
+                    // During quiet hours the supervisor has paused everything —
+                    // do nothing until the window ends. Dwell time keeps
+                    // accruing, so rotation resumes immediately afterwards.
+                    let quiet = sh.quiet.load(Ordering::Relaxed);
+                    let due = last_tick.map(|t| t.elapsed() >= dwell).unwrap_or(true);
+                    if !quiet && due {
+                        let (live, kept, total) = s.rotate_tick(rotate_window, cursor).await;
+                        if total >= rotate_window {
+                            println!(
+                                "[seed] rotation — {live} live of {total} (window at {}{})",
+                                cursor % total,
+                                if kept > 0 {
+                                    format!(", {kept} kept for connected peers")
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            cursor = cursor.wrapping_add(rotate_window);
+                            last_tick = Some(std::time::Instant::now());
+                        }
+                        // else: registration still filling the session — the
+                        // tick above brought everything so far live; re-check
+                        // soon (last_tick stays None → due stays true).
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            });
+        }
+    }
+
+    // ── seed stats poller ────────────────────────────────────────────────────
+    // Poll interval doubles as the integration step for uploaded_bytes below,
+    // so the two can never drift apart.
+    #[cfg(feature = "seed")]
+    const POLL_SECS: u64 = 10;
+    #[cfg(feature = "seed")]
+    if let Some(s) = seeder.clone() {
+        let sh = shared.clone();
+        tokio::spawn(async move {
+            loop {
+                let (up, peers, torrents) = s.stats();
+                sh.seed_up_bps.store(up, Ordering::Relaxed);
+                sh.peers.store(peers, Ordering::Relaxed);
+                sh.torrents.store(torrents, Ordering::Relaxed);
+                // librqbit exposes no lifetime "total uploaded" counter we can
+                // read reliably, so approximate one: integrate the instantaneous
+                // rate over this tick. Monotonic and self-consistent — and,
+                // unlike the old placeholder, not permanently zero.
+                sh.uploaded_bytes.fetch_add(up * POLL_SECS, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+            }
+        });
+    }
+
+    // ── download loop (bounded concurrency) ──────────────────────────────────
+    // Fetch several files at once so one slow or briefly-failing file can't
+    // stall the whole line (the single biggest MVP limitation).
+    if !no_download {
+        let storage_root = config::downloads_dir(&settings);
+        let missing: Vec<masterlist::Entry> = entries
+            .iter()
+            .filter(|e| {
+                let p = storage_root.join(config::shard_for(&e.name)).join(&e.name);
+                !std::fs::metadata(&p).map(|m| m.len() == e.size).unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        let total = entries.len();
+        println!("[download] {} files to fetch (4 in parallel)", missing.len());
+
+        let dl_state = std::sync::Arc::new(tokio::sync::Mutex::new(dl_state));
+        use futures_util::stream::StreamExt as _;
+        futures_util::stream::iter(missing)
+            .for_each_concurrent(4, |e| {
+                let client = client.clone();
+                let shared = shared.clone();
+                let dl_state = dl_state.clone();
+                let storage_root = storage_root.clone();
+                #[cfg(feature = "seed")]
+                let torrents_dir = torrents_dir.clone();
+                #[cfg(feature = "seed")]
+                let seeder = seeder.clone();
+                async move {
+                    // Quiet hours: don't start new fetches until the window
+                    // ends (a file already in flight finishes first — it's
+                    // small — then its slot waits here).
+                    while shared.quiet.load(Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    let url = match e.download_url() {
+                        Some(u) => u.to_string(),
+                        None => return,
+                    };
+                    let dest = storage_root.join(config::shard_for(&e.name)).join(&e.name);
+                    if let Ok(download::Outcome::Downloaded) | Ok(download::Outcome::Skipped) =
+                        download::ensure_file(&client, &url, &dest, e.size).await
+                    {
+                        let held = shared.held.fetch_add(1, Ordering::Relaxed) + 1;
+                        shared.storage_bytes.fetch_add(e.size, Ordering::Relaxed);
+                        {
+                            let mut ds = dl_state.lock().await;
+                            ds[e.id()] = serde_json::json!({ "downloaded": true, "diskSize": e.size });
+                            if held % 25 == 0 {
+                                state::save_download_state(&ds);
+                            }
+                        }
+                        if held % 25 == 0 {
+                            println!("[download] {held}/{total} held ({:.1}%)", shared.coverage_pct());
+                        }
+                        #[cfg(feature = "seed")]
+                        if let Some(s) = &seeder {
+                            // Freshly downloaded files go live immediately —
+                            // the rotation folds them into its cycle on the
+                            // next tick.
+                            let _ = s.seed_file(&dest, &torrents_dir, Some(&e.info_hash), false).await;
+                        }
+                    }
+                }
+            })
+            .await;
+
+        let ds = dl_state.lock().await;
+        state::save_download_state(&ds);
+        println!("[download] pass complete — {} held", shared.held.load(Ordering::Relaxed));
+    }
+
+    shared.downloading.store(false, Ordering::Relaxed);
+    println!("[node] steady state — seeding + heartbeat + dashboard running. Ctrl-C to stop.");
+    tokio::signal::ctrl_c().await.ok();
+    println!("\n[node] shutting down.");
+    Ok(())
+}

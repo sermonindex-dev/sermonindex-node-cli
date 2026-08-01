@@ -1,0 +1,100 @@
+name: Build & Publish CLI
+
+# Push a tag (v0.2.0) and this builds the Linux binaries and publishes them,
+# plus the source tarball and install.sh, to the Bunny CDN — the same place
+# /node-software/ already reads its release list from.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            label: x86_64-linux
+          - runner: ubuntu-24.04-arm      # native ARM; free on public repos
+            target: aarch64-unknown-linux-musl
+            label: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl-tools provides musl-gcc; perl + make are needed because openssl is
+      # compiled from source (see the vendored-openssl note in Cargo.toml).
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev perl make pkg-config
+
+      - name: Build (static, release)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        # --bin so the dev-only memtest helper never blocks a release build.
+        run: cargo build --release --bin sermonindex-node --target ${{ matrix.target }}
+
+      # A dynamically-linked binary installs fine and then refuses to start on an
+      # older NAS with "GLIBC_2.34 not found" — a worse failure than not shipping
+      # one at all, and one you'd only hear about days later. Fail here instead.
+      - name: Prove the binary is static and runs
+        run: |
+          f=target/${{ matrix.target }}/release/sermonindex-node
+          file "$f"
+          if ldd "$f" 2>&1 | grep -qE 'not a dynamic executable|statically linked'; then
+            echo "OK: static"
+          else
+            echo "NOT STATIC — refusing to publish"; ldd "$f"; exit 1
+          fi
+          "$f" version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.label }}
+          path: target/${{ matrix.target }}/release/sermonindex-node
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # install.sh picks an asset by testing whether the platform string appears
+      # in the filename, so these names are load-bearing: x86_64-linux / aarch64-linux.
+      - name: Assemble dist/
+        run: |
+          mkdir -p dist
+          for l in x86_64-linux aarch64-linux; do
+            cp "artifacts/bin-$l/sermonindex-node" "dist/sermonindex-node-${GITHUB_REF_NAME}-$l"
+          done
+          chmod +x dist/*
+          ls -la dist/
+
+      - name: Publish to Bunny CDN
+        env:
+          BUNNY_STORAGE_KEY: ${{ secrets.BUNNY_STORAGE_KEY }}
+          BUNNY_API_KEY:     ${{ secrets.BUNNY_API_KEY }}
+        run: bash publish-node-cli.sh
+
+      - name: Attach binaries to the GitHub release too
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

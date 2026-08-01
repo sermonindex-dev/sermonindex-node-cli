@@ -1,0 +1,32 @@
+[Unit]
+Description=SermonIndex seed node (headless)
+Documentation=https://sermonindex.net
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The install script replaces __USER__ with the account that owns ~/.sermonindex.
+User=__USER__
+Environment=HOME=/home/__USER__
+# Point storage at a big drive by adding e.g.  --dir /mnt/library
+ExecStart=/usr/local/bin/sermonindex-node start --scope audio
+Restart=always
+RestartSec=10
+LimitNOFILE=1048576
+
+# ── Resource guards — keep the box responsive even at a full 25k-torrent seed ──
+# Run at low priority so the node always yields CPU/IO to the rest of the system
+# (SSH stays snappy, the desktop/kiosk stays smooth).
+Nice=10
+CPUWeight=40
+IOWeight=40
+# Soft memory cap as a PERCENTAGE of RAM, so it scales to any device (4GB Pi 5,
+# 4GB/2GB Pi 4, …). Above this the kernel reclaims/throttles THIS service and
+# spills to swap instead of letting the whole Pi freeze. No hard MemoryMax, so it
+# is never OOM-killed into a restart loop — it just gets slower under pressure.
+MemoryAccounting=yes
+MemoryHigh=80%
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>net.sermonindex.node</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/sermonindex-node</string>
+    <string>start</string>
+    <string>--scope</string>
+    <string>audio</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- A seed node holds a file handle per seeded torrent; macOS defaults to
+       only 256, so raise it well above the full library size. -->
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>1048576</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/sermonindex-node.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/sermonindex-node.log</string>
+</dict>
+</plist>
