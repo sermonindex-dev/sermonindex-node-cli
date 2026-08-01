@@ -8,6 +8,13 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# The publish job creates a GitHub release to mirror the binaries. Without this
+# the default GITHUB_TOKEN is read-only on this repo and that step dies with
+# "403 Resource not accessible by integration" — after the CDN upload has
+# already succeeded, so the release looks half-failed when it actually shipped.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:

@@ -40,16 +40,29 @@ pub async fn check_seed_access(client: &reqwest::Client, node_id: &str) -> bool 
 ///                 (or "seed"/blue if the admin has granted this node seed status)
 ///   Some(false) — the probe ran but no inbound worked → "peer"/yellow
 ///   None        — probe service unavailable → leave reachability unknown
-pub async fn probe_reachability(client: &reqwest::Client, port: u16) -> Option<bool> {
-    // Offer our global IPv6 (if any) so the edge can attempt the v6 dial — the
-    // address a BitTorrent peer would actually use for global egress.
-    let body = match crate::net::global_ipv6() {
-        Some(v6) => json!({ "port": port, "ipv6": [v6.to_string()] }),
-        None => json!({ "port": port }),
-    };
+/// A client pinned to IPv4 egress.
+///
+/// Binding the local address to 0.0.0.0 forces the connection over IPv4. This
+/// is the whole fix for a class of node that reported itself unreachable while
+/// being perfectly reachable: the edge tests `open` against the address the
+/// request ARRIVES from, and only tests `open_v6` against addresses we put in
+/// the body. A dual-stack host sends this over IPv6 by default, so the edge
+/// would test our (usually firewalled) IPv6 address as `open` and never learn
+/// about a forwarded IPv4 port at all. Measured on a real node: IPv4 42800 open
+/// and confirmed by hand, yet the node kept reporting reachable=false.
+fn ipv4_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(format!("sermonindex-node/{}", env!("CARGO_PKG_VERSION")))
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()
+}
+
+async fn post_probe(client: &reqwest::Client, body: &Value) -> Option<(bool, bool)> {
     let resp = client
         .post(format!("{PROBE_API}/probe"))
-        .json(&body)
+        .json(body)
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
@@ -61,8 +74,32 @@ pub async fn probe_reachability(client: &reqwest::Client, port: u16) -> Option<b
     if !data.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         return None;
     }
-    let open = data.get("open").and_then(|v| v.as_bool()).unwrap_or(false);
-    let open_v6 = data.get("open_v6").and_then(|v| v.as_bool()).unwrap_or(false);
+    Some((
+        data.get("open").and_then(|v| v.as_bool()).unwrap_or(false),
+        data.get("open_v6").and_then(|v| v.as_bool()).unwrap_or(false),
+    ))
+}
+
+pub async fn probe_reachability(client: &reqwest::Client, port: u16) -> Option<bool> {
+    // Offer our global IPv6 (if any) so the edge can attempt the v6 dial — the
+    // address a BitTorrent peer would actually use for global egress. The v6
+    // list travels in the BODY, so a single request sent over IPv4 still gets
+    // both answers: `open` for our public IPv4, `open_v6` for the addresses here.
+    let body = match crate::net::global_ipv6() {
+        Some(v6) => json!({ "port": port, "ipv6": [v6.to_string()] }),
+        None => json!({ "port": port }),
+    };
+
+    // Prefer the IPv4-pinned client so `open` is a real IPv4 measurement. Fall
+    // back to the shared client on an IPv6-only host, where forcing IPv4 would
+    // fail outright — there, `open` is judged against the v6 address as before.
+    let (open, open_v6) = match ipv4_client() {
+        Some(c4) => match post_probe(&c4, &body).await {
+            Some(r) => r,
+            None => post_probe(client, &body).await?,
+        },
+        None => post_probe(client, &body).await?,
+    };
     Some(open || open_v6)
 }
 
