@@ -30,55 +30,17 @@ pub struct Shared {
     /// "Data Transferred" / "Uploaded across granted seeds".
     pub uploaded_bytes: AtomicU64,
     pub peers: AtomicU64,
-    /// Peers that DIALLED US, summed across live torrents (all address
-    /// families). This is the only honest answer to "am I actually serving the
-    /// internet, or just taking from it?" — an outbound connection proves our
-    /// egress works and nothing more. Feeds the dashboard's "peers served".
-    pub peers_in: AtomicU64,
-    /// Peers this node dialled out to.
-    pub peers_out: AtomicU64,
-    /// High-water mark of `peers_in` for this run. `peers_in` is a snapshot and
-    /// falls back to 0 whenever the live window rotates away from the torrents
-    /// those peers were on; the previous UI read that momentary 0 as "you have
-    /// helped nobody", which was simply wrong. This never decreases.
-    pub peers_in_peak: AtomicU64,
     pub torrents: AtomicU64,
-    /// The TCP port the seed session really bound (0 = not seeding). Set once
-    /// at startup from `Seeder::port()`; everything that reports a port — the
-    /// reachability probe, the heartbeat, /stats — must read THIS, never the
-    /// LISTEN_PORT_START constant.
-    pub listen_port: AtomicU64,
     pub seed_up_bps: AtomicU64, // from the torrent session (0 if seeding off)
     pub reachable: AtomicU8,    // 0 = unknown, 1 = reachable (v4 or v6), 2 = closed
     pub seed_granted: AtomicBool, // admin has flipped seed_access.enabled for us
     pub downloading: AtomicBool,
-    /// The library drive is full. Downloading stops; seeding does NOT — a full
-    /// disk is a reason to stop growing, never a reason to stop serving what is
-    /// already there. Cleared automatically once space reappears.
-    pub disk_full: AtomicBool,
     /// Scheduled quiet hours are in effect right now — seeding, serving and
     /// downloading are suspended so the connection is free (church livestream).
     pub quiet: AtomicBool,
     pub network: Mutex<Value>,      // merged /api/node/map + /api/node/stats
     pub stats_json: Mutex<String>,  // the rendered /stats payload the server serves
     pub trends: Mutex<Trends>,
-    /// Newer released version, when one exists. Notify-only by design: a
-    /// headless seed box that restarts itself mid-serve is worse than one that
-    /// is a version behind, so nothing here ever installs anything.
-    pub update_available: Mutex<Option<String>>,
-    /// Master-list version currently loaded, so the refresh loop and the
-    /// dashboard agree on what the node actually knows about.
-    pub masterlist_version: AtomicU64,
-    /// NAT-PMP / PCP mapping state: "trying" | "mapped via <gw>" | "unavailable"
-    /// | "off". Reported so a node owner can tell the difference between "my
-    /// router refused" and "we never tried".
-    /// `Arc` rather than a bare `Mutex` because the renewal task in natpmp.rs
-    /// owns a handle to it for the life of the process and writes the result of
-    /// each attempt; `Shared` only ever reads it.
-    pub natpmp: std::sync::Arc<Mutex<String>>,
-    /// Last 7 days of hourly history, newest last — the rendered form of
-    /// history.jsonl, served at /stats for the dashboard's charts.
-    pub history: Mutex<Value>,
 }
 
 #[derive(Default)]
@@ -88,8 +50,6 @@ pub struct Trends {
     pub cpu: VecDeque<f64>,
     pub temp: VecDeque<f64>,
     pub peers: VecDeque<f64>,
-    pub peers_in: VecDeque<f64>,
-    pub peers_out: VecDeque<f64>,
     pub net_up: VecDeque<f64>,
 }
 
@@ -106,7 +66,6 @@ impl Trends {
             "up_bps": f(&self.up_bps), "down_bps": f(&self.down_bps),
             "cpu": f(&self.cpu), "temp": f(&self.temp),
             "peers": f(&self.peers), "net_up": f(&self.net_up),
-            "peers_in": f(&self.peers_in), "peers_out": f(&self.peers_out),
         })
     }
 }
@@ -122,32 +81,16 @@ impl Shared {
             storage_bytes: AtomicU64::new(0),
             uploaded_bytes: AtomicU64::new(0),
             peers: AtomicU64::new(0),
-            peers_in: AtomicU64::new(0),
-            peers_out: AtomicU64::new(0),
-            peers_in_peak: AtomicU64::new(0),
             torrents: AtomicU64::new(0),
-            listen_port: AtomicU64::new(0),
             seed_up_bps: AtomicU64::new(0),
             reachable: AtomicU8::new(0),
             seed_granted: AtomicBool::new(false),
             downloading: AtomicBool::new(true),
-            disk_full: AtomicBool::new(false),
             quiet: AtomicBool::new(false),
             network: Mutex::new(json!({})),
             stats_json: Mutex::new("{}".to_string()),
             trends: Mutex::new(Trends::default()),
-            update_available: Mutex::new(None),
-            natpmp: std::sync::Arc::new(Mutex::new("off".to_string())),
-            masterlist_version: AtomicU64::new(0),
-            history: Mutex::new(json!([])),
         }
-    }
-
-    /// Record a direction scan. `peers_in_peak` only ever rises.
-    pub fn set_directions(&self, incoming: u64, outgoing: u64) {
-        self.peers_in.store(incoming, Ordering::Relaxed);
-        self.peers_out.store(outgoing, Ordering::Relaxed);
-        self.peers_in_peak.fetch_max(incoming, Ordering::Relaxed);
     }
 
     /// Record the latest reachability self-test (None = unknown/probe failed).
@@ -211,8 +154,6 @@ impl Shared {
             Trends::push(&mut t.cpu, sys.cpu_pct as f64);
             Trends::push(&mut t.temp, sys.temp_c.unwrap_or(0.0) as f64);
             Trends::push(&mut t.peers, peers as f64);
-            Trends::push(&mut t.peers_in, self.peers_in.load(Ordering::Relaxed) as f64);
-            Trends::push(&mut t.peers_out, self.peers_out.load(Ordering::Relaxed) as f64);
             Trends::push(&mut t.net_up, up_bps);
         }
         let trends = self.trends.lock().unwrap().to_json();
@@ -220,11 +161,7 @@ impl Shared {
 
         let node = json!({
             "available": true,
-            // The port actually bound, not the constant (see Shared::listen_port).
-            "port": match self.listen_port.load(Ordering::Relaxed) {
-                0 => config::LISTEN_PORT_START as u64,
-                p => p,
-            },
+            "port": config::LISTEN_PORT_START,
             "peers": peers,
             "uptime_s": self.started.elapsed().as_secs(),
             "coverage_pct": self.coverage_pct(),
@@ -236,17 +173,8 @@ impl Shared {
             "uploaded_bytes": self.uploaded_bytes.load(Ordering::Relaxed),
             "reachable": self.reachable_label(),
             "quiet": self.quiet.load(Ordering::Relaxed),
-            "disk_full": self.disk_full.load(Ordering::Relaxed),
             "seed_granted": self.seed_granted.load(Ordering::Relaxed),
             "category": self.category(),
-            // Direction. `peers` above is a bare total and cannot answer the
-            // question that matters; these can.
-            "peers_in": self.peers_in.load(Ordering::Relaxed),
-            "peers_out": self.peers_out.load(Ordering::Relaxed),
-            "peers_in_peak": self.peers_in_peak.load(Ordering::Relaxed),
-            "masterlist_version": self.masterlist_version.load(Ordering::Relaxed),
-            "update_available": self.update_available.lock().unwrap().clone(),
-            "natpmp": self.natpmp.lock().unwrap().clone(),
         });
         let system = json!({
             "cpu_pct": (sys.cpu_pct as f64 * 10.0).round() / 10.0,
@@ -257,10 +185,9 @@ impl Shared {
             "disk_used": sys.disk_used, "disk_total": sys.disk_total,
             "nic": sys.nic, "up_bps": up_bps, "down_bps": sys.down_bps,
         });
-        let history = self.history.lock().unwrap().clone();
         let out = json!({
             "node": node, "system": system, "network": network,
-            "trends": trends, "history": history, "at": now_secs(),
+            "trends": trends, "at": now_secs(),
         });
         *self.stats_json.lock().unwrap() = out.to_string();
     }
@@ -339,103 +266,4 @@ pub fn build_network_view(map: &Value, stats: &Value, my_node_id: &str) -> Value
 
 fn nodes_len(map: &Value) -> u64 {
     map.get("nodes").and_then(|v| v.as_array()).map(|a| a.len() as u64).unwrap_or(0)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// history.jsonl — the long view
-//
-// `Trends` above holds 90 samples at 2 s: three minutes, in RAM, gone on
-// restart. That is a live needle, not a record, and it cannot answer "over a
-// week, how much did I give versus take?" — which is the question a person
-// running a seed node actually has.
-//
-// So: one JSON object per line, appended hourly, in the data dir. Append-only
-// is the right shape here. It is crash-safe by construction (a torn final line
-// is skipped on read, not fatal), it costs one open/write/close an hour, and
-// on a Pi's SD card that is nothing. Trimmed to RETAIN_DAYS on write so the
-// file cannot grow without bound.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const RETAIN_DAYS: u64 = 90;
-const HISTORY_WINDOW_DAYS: u64 = 7;
-
-fn history_path() -> std::path::PathBuf {
-    config::data_dir().join("history.jsonl")
-}
-
-/// One hourly sample. `up`/`down` are cumulative counters, not rates, so a
-/// reader can difference two rows and get real bytes for that hour even if the
-/// node was asleep in between.
-pub fn append_history(shared: &Shared, up_total: u64, down_total: u64) {
-    let row = json!({
-        "ts": now_secs(),
-        "peers_in": shared.peers_in.load(Ordering::Relaxed),
-        "peers_out": shared.peers_out.load(Ordering::Relaxed),
-        "peers_in_peak": shared.peers_in_peak.load(Ordering::Relaxed),
-        "peers": shared.peers.load(Ordering::Relaxed),
-        "up": up_total,
-        "down": down_total,
-        "held": shared.held.load(Ordering::Relaxed),
-        "torrents": shared.torrents.load(Ordering::Relaxed),
-        "reachable": shared.reachable_label(),
-    });
-
-    let dir = config::data_dir();
-    std::fs::create_dir_all(&dir).ok();
-    let path = history_path();
-
-    // Read, trim, rewrite when the file has aged past RETAIN_DAYS; otherwise
-    // just append. The trim is rare (once a day at most, and only after three
-    // months of uptime), so the common path stays a bare append.
-    let cutoff = now_secs().saturating_sub(RETAIN_DAYS * 86_400);
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let needs_trim = existing
-        .lines()
-        .next()
-        .and_then(|l| serde_json::from_str::<Value>(l).ok())
-        .and_then(|v| v.get("ts").and_then(|t| t.as_u64()))
-        .map(|ts| ts < cutoff)
-        .unwrap_or(false);
-
-    if needs_trim {
-        let kept: String = existing
-            .lines()
-            .filter(|l| {
-                serde_json::from_str::<Value>(l)
-                    .ok()
-                    .and_then(|v| v.get("ts").and_then(|t| t.as_u64()))
-                    .map(|ts| ts >= cutoff)
-                    .unwrap_or(false)
-            })
-            .map(|l| format!("{l}\n"))
-            .collect();
-        let tmp = dir.join("history.jsonl.part");
-        if std::fs::write(&tmp, kept + &row.to_string() + "\n").is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-        return;
-    }
-
-    use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{row}");
-    }
-}
-
-/// The last `HISTORY_WINDOW_DAYS` of samples, oldest first, for /stats.
-///
-/// A malformed line (a half-written row from a power cut) is skipped rather
-/// than failing the read — the whole point of the format.
-pub fn load_history() -> Value {
-    let cutoff = now_secs().saturating_sub(HISTORY_WINDOW_DAYS * 86_400);
-    let text = match std::fs::read_to_string(history_path()) {
-        Ok(t) => t,
-        Err(_) => return json!([]),
-    };
-    let rows: Vec<Value> = text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0) >= cutoff)
-        .collect();
-    json!(rows)
 }

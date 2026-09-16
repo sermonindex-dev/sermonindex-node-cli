@@ -13,9 +13,6 @@ mod masterlist;
 mod net;
 mod state;
 mod system;
-mod cfg;
-mod natpmp;
-mod update;
 #[cfg(feature = "seed")]
 mod seed;
 
@@ -24,7 +21,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
 use state::Shared;
 
 fn main() -> Result<()> {
@@ -40,14 +36,6 @@ fn main() -> Result<()> {
             Ok(())
         }
         "status" => run_status(),
-        "config" | "set" | "settings" => cfg::run(&args),
-        "peers" => run_peers(),
-        "history" => run_history(),
-        "port" => run_port(),
-        "update" => {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            rt.block_on(run_update())
-        }
         "quiet" => run_quiet(&args),
         "verify" => {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -94,31 +82,6 @@ COMMANDS
                  quiet add sun,wed 08:00-13:00  several days at once
                  quiet remove 2                 delete window 2 from the list
                  quiet clear                    remove all quiet hours
-  config       View or change any setting — the same controls the desktop app
-               has, from the terminal. Writes settings.json atomically, so the
-               app and the node can both edit it safely.
-                 config                         show everything
-                 config scope full              audio (~412 GB) | full (~2.4 TB)
-                 config dir /mnt/library        where the library lives
-                 config upload 2000             KB/s, or "off" for unlimited
-                 config monthly-cap 500GB       total upload per month, or "off"
-                 config schedule 22:00-06:00    only seed in this window ("off")
-                 config p2p off                 download and hold; never serve
-                 config source archive          prefer archive.org over the CDN
-                 config dht on|off              join the DHT
-                 config peers 16                connections per torrent
-                 config window 4000             torrents live at once
-                 config rotate 15               minutes per rotation window
-                 config reset                   tuning back to this machine's
-                                                defaults (keeps id/dir/quiet)
-  peers        Who is connected right now, and which way round — the terminal
-               view of the app's "Giving vs Taking".
-  history      The last 7 days: peers in vs out, uploaded, files held.
-  port         What port we bound, whether the internet can reach it, and what
-               NAT-PMP/UPnP managed to do about it.
-  update       Check whether a newer node has been released. Never installs
-               anything on its own — a seed node mid-upload does not restart
-               itself because a version number changed.
   verify       Audit the library against the signed master list (presence +
                exact size for every file) and report coverage. Read-only.
   version      Print the version.
@@ -339,184 +302,6 @@ fn run_status() -> Result<()> {
     if let Some(why) = config::quiet_now(&settings) {
         println!("              QUIET RIGHT NOW — {why}");
     }
-    println!("  version:    {}", update::current());
-
-    // Everything above is read off disk and is true whether or not a node is
-    // running. Everything below can only come from a live process.
-    match live_stats() {
-        Some(v) => {
-            let n = &v["node"];
-            let g = |k: &str| n.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-            println!("\n  RUNNING");
-            println!("    port:       {}", g("port"));
-            println!("    reachable:  {}", n.get("reachable").and_then(|x| x.as_str()).unwrap_or("unknown"));
-            println!("    NAT-PMP:    {}", n.get("natpmp").and_then(|x| x.as_str()).unwrap_or("off"));
-            println!("    held:       {} of {} ({:.1}%)", g("held"), g("catalog"),
-                     n.get("coverage_pct").and_then(|x| x.as_f64()).unwrap_or(0.0));
-            println!("    peers:      {} now · {} came to you this run", g("peers"), g("peers_in_peak"));
-            println!("    master list v{}", g("masterlist_version"));
-            if let Some(u) = n.get("update_available").and_then(|x| x.as_str()) {
-                println!("\n    UPDATE AVAILABLE: {u} — run `sermonindex-node update`");
-            }
-        }
-        None => println!("\n  Not running. Start with `sermonindex-node start`."),
-    }
-    Ok(())
-}
-
-
-// ── live-node queries ────────────────────────────────────────────────────────
-//
-// These read /stats off the RUNNING node rather than recomputing anything. That
-// is the honest thing to do: the running process is the only thing that knows
-// how many peers are connected, and a second process guessing would be a second
-// answer to the same question. When nothing is running they say so plainly
-// instead of printing zeroes, because "no node" and "a node serving nobody"
-// are very different situations and must never look the same.
-
-fn live_stats() -> Option<Value> {
-    let url = format!("http://127.0.0.1:{}/stats", config::DASHBOARD_PORT);
-    let out = std::process::Command::new("curl")
-        .args(["-s", "-m", "3", &url])
-        .output()
-        .ok()?;
-    serde_json::from_slice::<Value>(&out.stdout).ok()
-}
-
-fn need_running() -> Option<Value> {
-    match live_stats() {
-        Some(v) if v.get("node").is_some() => Some(v),
-        _ => {
-            println!("No running node found on port {}.", config::DASHBOARD_PORT);
-            println!("Start one with `sermonindex-node start`, then try again.");
-            None
-        }
-    }
-}
-
-fn run_peers() -> Result<()> {
-    let Some(v) = need_running() else { return Ok(()) };
-    let n = &v["node"];
-    let g = |k: &str| n.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    let (inb, out, peak, now) = (g("peers_in"), g("peers_out"), g("peers_in_peak"), g("peers"));
-
-    println!("\nPeer connections");
-    println!("  connected right now      {now}");
-    println!("  came to you (now)        {inb}");
-    println!("  you reached out (now)    {out}");
-    println!("  came to you (this run)   {peak}   <- the one that means you are serving");
-    println!();
-    if peak == 0 {
-        println!("  Nobody has connected TO you yet this run. You are still uploading to");
-        println!("  every peer you reach, but you are not a meeting point others can find.");
-        println!("  Run `sermonindex-node port` to see whether that is fixable here.");
-    } else if inb >= out {
-        println!("  More peers came to you than you reached out to — your node is a place");
-        println!("  others can find. This is the healthy picture.");
-    } else {
-        println!("  You reach out more than peers come to you. Normal when the port is");
-        println!("  closed, and still useful — you serve everyone you connect to.");
-    }
-    println!();
-    Ok(())
-}
-
-fn run_history() -> Result<()> {
-    let rows = state::load_history();
-    let rows = rows.as_array().cloned().unwrap_or_default();
-    if rows.is_empty() {
-        println!("No history recorded yet — a row is written every hour once the node runs.");
-        println!("File: {}", config::data_dir().join("history.jsonl").display());
-        return Ok(());
-    }
-    // Fold hourly rows into calendar days, keeping each day's PEAK. The live
-    // figure drops to 0 every time the rotation window moves off the torrents
-    // those peers were on, so a day when twenty people took sermons from this
-    // node could otherwise be written down as a zero.
-    use std::collections::BTreeMap;
-    let mut days: BTreeMap<String, (u64, u64, u64, u64)> = BTreeMap::new();
-    for r in &rows {
-        let ts = r.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
-        if ts == 0 { continue; }
-        let day = ts / 86_400;
-        let key = format!("{day}");
-        let g = |k: &str| r.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-        let e = days.entry(key).or_insert((0, 0, 0, 0));
-        e.0 = e.0.max(g("peers_in_peak").max(g("peers_in")));
-        e.1 = e.1.max(g("peers_out"));
-        e.2 = e.2.max(g("up"));
-        e.3 = e.3.max(g("held"));
-    }
-    println!("\nLast {} day(s)\n", days.len());
-    println!("  {:<12} {:>9} {:>9} {:>12} {:>9}", "day", "came to", "reached", "uploaded", "held");
-    println!("  {}", "-".repeat(55));
-    let mut prev_up = 0u64;
-    for (i, (k, v)) in days.iter().enumerate() {
-        let secs = k.parse::<u64>().unwrap_or(0) * 86_400;
-        let label = day_label(secs);
-        // `up` is cumulative, so difference consecutive days for the real
-        // per-day figure. The first row has nothing to subtract from.
-        let delta = if i == 0 { 0 } else { v.2.saturating_sub(prev_up) };
-        prev_up = v.2;
-        println!(
-            "  {:<12} {:>9} {:>9} {:>12} {:>9}",
-            label, v.0, v.1,
-            if i == 0 { "-".to_string() } else { human_bytes(delta) },
-            v.3
-        );
-    }
-    println!();
-    Ok(())
-}
-
-/// "16 Sep" from a unix timestamp. chrono is already a dependency, so there is
-/// no reason to hand-roll civil-from-days and every reason not to.
-fn day_label(secs: u64) -> String {
-    use chrono::{Local, TimeZone};
-    match Local.timestamp_opt(secs as i64, 0).single() {
-        Some(dt) => dt.format("%-d %b").to_string(),
-        None => "?".to_string(),
-    }
-}
-
-fn run_port() -> Result<()> {
-    let Some(v) = need_running() else { return Ok(()) };
-    let n = &v["node"];
-    let port = n.get("port").and_then(|x| x.as_u64()).unwrap_or(0);
-    let reach = n.get("reachable").and_then(|x| x.as_str()).unwrap_or("unknown");
-    let nat = n.get("natpmp").and_then(|x| x.as_str()).unwrap_or("off");
-
-    println!("\nPort and reachability");
-    println!("  listening on     TCP {port}");
-    if port != config::LISTEN_PORT_START as u64 {
-        println!("                   (NOT the default {} — forward THIS one)", config::LISTEN_PORT_START);
-    }
-    println!("  NAT-PMP / PCP    {nat}");
-    println!("  inbound test     {reach}");
-    println!();
-    match reach {
-        "reachable" => println!("  Peers can dial you directly. Nothing to do."),
-        "closed" => {
-            println!("  Nothing could connect in. If you can, forward TCP {port} on your");
-            println!("  router to this machine. Many people cannot — Starlink, T-Mobile Home");
-            println!("  Internet and most mobile broadband share one address between homes —");
-            println!("  and a node that only dials out is still genuinely useful.");
-        }
-        _ => println!("  Not tested yet — the check runs a few minutes after start."),
-    }
-    println!();
-    Ok(())
-}
-
-async fn run_update() -> Result<()> {
-    let client = reqwest::Client::builder()
-        .user_agent(format!("sermonindex-node/{}", env!("CARGO_PKG_VERSION")))
-        .build()?;
-    println!("Running {}. Checking for a newer release…", update::current());
-    match update::check(&client).await {
-        Some(v) => println!("\n{}\n", update::install_hint(&v)),
-        None => println!("\nYou are up to date (or the release manifest could not be reached).\n"),
-    }
     Ok(())
 }
 
@@ -690,33 +475,18 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         tokio::spawn(async move {
             let geo = heartbeat::geo(&cl).await;
             loop {
-                // Probe the port the session REALLY bound, not the constant.
-                // `Seeder::start` walks 42800..=42839 for a free one; testing
-                // the constant on a node that landed on 42801 tested a closed
-                // port forever and reported this node unreachable forever,
-                // however correctly its owner had forwarded the live port.
-                // 0 means seeding is off — fall back to the constant, which is
-                // the only port anyone could have forwarded anyway.
-                let port = match sh.listen_port.load(Ordering::Relaxed) {
-                    0 => config::LISTEN_PORT_START,
-                    p => p as u16,
-                };
-                let reachable = heartbeat::probe_reachability(&cl, port).await;
+                // Self-test inbound reachability (IPv4 + IPv6) the same way the
+                // desktop app does, then report it so the map can classify this
+                // node green/blue (reachable) vs yellow (peer).
+                let reachable =
+                    heartbeat::probe_reachability(&cl, config::LISTEN_PORT_START).await;
                 sh.set_reachable(reachable);
                 // Blue ONLY when the node admin has granted this node seed status
                 // (seed_access.enabled). We must keep reporting it each beat or the
                 // server upsert reverts node_type to "user".
                 let granted = heartbeat::check_seed_access(&cl, &sh.node_id).await;
                 sh.set_granted(granted);
-                // The response may carry a newer released version. This is a
-                // free push channel — the request is happening regardless — so
-                // a release can reach the fleet in one beat instead of waiting
-                // out the 6-hour manifest poll.
-                if let Some(body) = heartbeat::beat(&cl, &sh, &geo, reachable, granted).await {
-                    if let Some(v) = update::from_heartbeat(&body) {
-                        *sh.update_available.lock().unwrap() = Some(v);
-                    }
-                }
+                heartbeat::beat(&cl, &sh, &geo, reachable, granted).await;
                 tokio::time::sleep(Duration::from_secs(300)).await;
             }
         });
@@ -774,48 +544,8 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     }
     println!("  quiet   {}", config::describe_quiet(&settings));
     #[cfg(feature = "seed")]
-    let peer_limit = config::peer_limit_per_torrent(&settings);
-    println!(
-        "  conns   {} per torrent ({:.0} GB RAM detected)",
-        peer_limit,
-        config::total_ram_gb()
-    );
-    let seeder = match seed::Seeder::start(
-        &config::downloads_dir(&settings),
-        upload_bps,
-        dht,
-        peer_limit,
-    )
-    .await
-    {
-        Ok(s) => {
-            // Publish the port that was ACTUALLY bound so the reachability
-            // probe, the heartbeat and /stats all report the same real number.
-            shared.listen_port.store(s.port() as u64, Ordering::Relaxed);
-            // NAT-PMP / PCP, on the port we ACTUALLY bound. librqbit has already
-            // tried UPnP; a great many routers have UPnP off but answer this.
-            // One task, one UDP round-trip an hour — see the note in natpmp.rs
-            // on why this is safe on a 4 GB Pi.
-            {
-                let st = shared.natpmp.clone();
-                *st.lock().unwrap() = "trying".to_string();
-                natpmp::spawn(s.port(), st);
-            }
-            if s.port() != config::LISTEN_PORT_START {
-                println!(
-                    "  port    {} (not the default {} — forward THIS one)",
-                    s.port(),
-                    config::LISTEN_PORT_START
-                );
-            }
-            if s.is_ipv6_socket() {
-                println!(
-                    "  socket  bound on [::] — if IPv4 inbound never opens, the\n\
-                     \x20         listener may be IPv6-only on this host"
-                );
-            }
-            Some(Arc::new(s))
-        }
+    let seeder = match seed::Seeder::start(&config::downloads_dir(&settings), upload_bps, dht).await {
+        Ok(s) => Some(Arc::new(s)),
         Err(e) => {
             eprintln!("[seed] disabled — could not start session: {e:#}");
             None
@@ -992,23 +722,11 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     if let Some(s) = seeder.clone() {
         let sh = shared.clone();
         tokio::spawn(async move {
-            // The direction scan walks the peer table of every LIVE torrent, so
-            // it is much heavier than reading the session snapshot. Under
-            // rotation only the live window is live (a few hundred at most), so
-            // it is bounded — but there is no reason to pay it every 10 s when
-            // the thing it measures moves on the scale of minutes.
-            let mut tick: u64 = 0;
             loop {
                 let (up, peers, torrents) = s.stats();
                 sh.seed_up_bps.store(up, Ordering::Relaxed);
                 sh.peers.store(peers, Ordering::Relaxed);
                 sh.torrents.store(torrents, Ordering::Relaxed);
-                if tick % 6 == 0 {
-                    // every ~60 s
-                    let d = s.directions();
-                    sh.set_directions(d.incoming, d.outgoing);
-                }
-                tick = tick.wrapping_add(1);
                 // librqbit exposes no lifetime "total uploaded" counter we can
                 // read reliably, so approximate one: integrate the instantaneous
                 // rate over this tick. Monotonic and self-consistent — and,
@@ -1059,25 +777,9 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                         return;
                     }
                     let dest = storage_root.join(config::shard_for(&e.name)).join(&e.name);
-                    let outcome = download::ensure_file(&client, &urls, &dest, e.size).await;
-                    if matches!(outcome, Ok(download::Outcome::NoSpace)) {
-                        // Say it ONCE, loudly, and stop asking for more. The
-                        // node keeps seeding everything it already holds —
-                        // a full disk is a reason to stop growing, never a
-                        // reason to stop serving.
-                        if !shared.disk_full.swap(true, Ordering::Relaxed) {
-                            eprintln!(
-                                "\n[disk] The drive is FULL. Downloading has stopped; seeding continues.\n\
-                                 [disk] Free some space, or point the node at a bigger drive with:\n\
-                                 [disk]   sermonindex-node config dir /path/to/bigger/drive\n"
-                            );
-                        }
-                        return;
-                    }
-                    if shared.disk_full.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    if let Ok(download::Outcome::Downloaded) | Ok(download::Outcome::Skipped) = outcome {
+                    if let Ok(download::Outcome::Downloaded) | Ok(download::Outcome::Skipped) =
+                        download::ensure_file(&client, &urls, &dest, e.size).await
+                    {
                         let held = shared.held.fetch_add(1, Ordering::Relaxed) + 1;
                         shared.storage_bytes.fetch_add(e.size, Ordering::Relaxed);
                         {
@@ -1108,248 +810,6 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     }
 
     shared.downloading.store(false, Ordering::Relaxed);
-
-    // ── history recorder ─────────────────────────────────────────────────────
-    // `Trends` is 90 samples at 2 s — three minutes, in RAM, gone on restart.
-    // That cannot answer "over a week, how much did I give versus take?", which
-    // is the question a person running a node actually has. One appended line
-    // an hour can.
-    {
-        let sh = shared.clone();
-        tokio::spawn(async move {
-            // Seed the served window from disk immediately, so a node that has
-            // been running for months shows its history the moment it restarts
-            // rather than drawing an empty chart for an hour.
-            *sh.history.lock().unwrap() = state::load_history();
-            loop {
-                tokio::time::sleep(Duration::from_secs(config::HISTORY_INTERVAL_SECS)).await;
-                let up = sh.uploaded_bytes.load(Ordering::Relaxed);
-                let down = sh.storage_bytes.load(Ordering::Relaxed);
-                state::append_history(&sh, up, down);
-                *sh.history.lock().unwrap() = state::load_history();
-            }
-        });
-    }
-
-    // ── weekly integrity sweep ───────────────────────────────────────────────
-    //
-    // `verify` has always existed as a manual command, which means it runs when
-    // somebody already suspects something. A 24/7 node needs the opposite: a
-    // check that runs when nobody suspects anything, because that is when bit
-    // rot and a half-written file from a power cut actually happen — and a
-    // corrupt file does not announce itself, it just fails every piece hash for
-    // every peer that ever asks, quietly, for months.
-    //
-    // Cheap by design: metadata only (presence + exact size), no re-hashing.
-    // At ~30k files that is a stat() each, a few seconds even on an SD card.
-    // Runs during quiet hours so it never competes with serving, and only when
-    // a week has passed since the last one — recorded on disk, so restarting
-    // the node does not restart the clock.
-    {
-        let sh = shared.clone();
-        let settings_v = settings.clone();
-        let entries_v: Vec<(String, u64)> =
-            entries.iter().map(|e| (e.name.clone(), e.size)).collect();
-        tokio::spawn(async move {
-            let stamp = config::data_dir().join("last-verify");
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-                let last = std::fs::read_to_string(&stamp)
-                    .ok()
-                    .and_then(|t| t.trim().parse::<u64>().ok())
-                    .unwrap_or(0);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                if now.saturating_sub(last) < 7 * 86_400 {
-                    continue;
-                }
-                // Prefer a quiet window. If the node has none configured we
-                // would wait for ever, so after 8 days run it regardless —
-                // metadata-only, it costs almost nothing either way.
-                if !sh.quiet.load(Ordering::Relaxed) && now.saturating_sub(last) < 8 * 86_400 {
-                    continue;
-                }
-                let mut ok = 0u64;
-                let mut missing = 0u64;
-                let mut wrong = 0u64;
-                for (name, size) in &entries_v {
-                    let p = config::file_path(&settings_v, name);
-                    match std::fs::metadata(&p) {
-                        Ok(m) if m.len() == *size => ok += 1,
-                        Ok(_) => wrong += 1,
-                        Err(_) => missing += 1,
-                    }
-                }
-                let _ = std::fs::write(&stamp, now.to_string());
-                if wrong > 0 || missing > 0 {
-                    println!(
-                        "[verify] weekly check — {ok} good, {wrong} WRONG SIZE, {missing} missing"
-                    );
-                    if wrong > 0 {
-                        println!(
-                            "[verify] a wrong-size file fails every piece hash it is asked for. \
-                             Delete those and the next refresh will re-fetch them."
-                        );
-                    }
-                } else {
-                    println!("[verify] weekly check — all {ok} files present and correct");
-                }
-                // Keep the reported figure honest after the sweep.
-                sh.held.store(ok, Ordering::Relaxed);
-            }
-        });
-    }
-
-    // ── update check (notify only) ───────────────────────────────────────────
-    {
-        let sh = shared.clone();
-        let cl = client.clone();
-        tokio::spawn(async move {
-            let mut announced: Option<String> = None;
-            loop {
-                if let Some(v) = update::check(&cl).await {
-                    *sh.update_available.lock().unwrap() = Some(v.clone());
-                    // Say it once per version, not once per check — a daemon
-                    // that logs the same line every six hours for a month is a
-                    // daemon whose log nobody reads.
-                    if announced.as_deref() != Some(v.as_str()) {
-                        println!("\n[update] {}\n", update::install_hint(&v));
-                        announced = Some(v);
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(config::UPDATE_CHECK_SECS)).await;
-            }
-        });
-    }
-
-    // ── master-list refresh ──────────────────────────────────────────────────
-    // Before 0.2.2 the list was read once, at startup, and the missing-file set
-    // computed once. A node up for three weeks served the library as it stood
-    // three weeks ago, and only a restart ever fixed it. This also doubles as
-    // the retry path for files that failed the first pass (Archive 503, a
-    // transient DNS blip): the filter is recomputed from what is on disk, so a
-    // file that did not land is simply missing again next hour.
-    if !no_download {
-        let cl = client.clone();
-        let sh = shared.clone();
-        let settings_r = settings.clone();
-        let scope_r = scope.clone();
-        #[cfg(feature = "seed")]
-        let torrents_dir_r = torrents_dir.clone();
-        #[cfg(feature = "seed")]
-        let seeder_r = seeder.clone();
-        let mut known_version = ml.version;
-        sh.masterlist_version.store(known_version, Ordering::Relaxed);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(config::MASTERLIST_REFRESH_SECS)).await;
-                if sh.quiet.load(Ordering::Relaxed) {
-                    continue;
-                }
-                // A full disk clears itself only by someone acting. Re-check
-                // each hour rather than latching forever: they may well have
-                // freed space, and nothing else would notice.
-                if sh.disk_full.load(Ordering::Relaxed) {
-                    let free = system::free_bytes(&config::downloads_dir(&settings_r));
-                    if free > 2 * 1024 * 1024 * 1024 {
-                        sh.disk_full.store(false, Ordering::Relaxed);
-                        println!("[disk] space is available again — resuming downloads");
-                    } else {
-                        continue;
-                    }
-                }
-                // Fail-closed, exactly like the startup fetch: an unverified
-                // list is never used, and a failed fetch just means we try
-                // again next hour with what we already have.
-                let fresh = match masterlist::fetch_verified(&cl).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("[masterlist] refresh failed (keeping v{known_version}): {e:#}");
-                        continue;
-                    }
-                };
-                let want_audio = scope_r != "full";
-                let all: Vec<masterlist::Entry> = fresh
-                    .entries
-                    .values()
-                    .filter(|e| if want_audio { e.is_audio() } else { e.is_audio() || e.is_video() })
-                    .cloned()
-                    .collect();
-                sh.total.store(all.len() as u64, Ordering::Relaxed);
-                if fresh.version != known_version {
-                    println!(
-                        "[masterlist] v{known_version} -> v{} — {} files in scope",
-                        fresh.version,
-                        all.len()
-                    );
-                    known_version = fresh.version;
-                    sh.masterlist_version.store(known_version, Ordering::Relaxed);
-                }
-
-                let missing: Vec<masterlist::Entry> = all
-                    .iter()
-                    .filter(|e| {
-                        let p = config::file_path(&settings_r, &e.name);
-                        !std::fs::metadata(&p).map(|m| m.len() == e.size).unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect();
-                if missing.is_empty() {
-                    continue;
-                }
-                println!("[masterlist] {} new or missing file(s) — fetching", missing.len());
-
-                let mut ds = state::load_download_state();
-                let mut got = 0u64;
-                for e in missing {
-                    if sh.quiet.load(Ordering::Relaxed) {
-                        break; // resume next hour; the window matters more
-                    }
-                    let urls: Vec<String> = e.download_urls().to_vec();
-                    if urls.is_empty() {
-                        continue;
-                    }
-                    let dest = config::file_path(&settings_r, &e.name);
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent).ok();
-                    }
-                    match download::ensure_file(&cl, &urls, &dest, e.size).await {
-                        Ok(download::Outcome::NoSpace) => {
-                            if !sh.disk_full.swap(true, Ordering::Relaxed) {
-                                eprintln!("[disk] drive full — new downloads paused, seeding continues");
-                            }
-                            break;
-                        }
-                        Ok(download::Outcome::Downloaded) | Ok(download::Outcome::Skipped) => {
-                            sh.held.fetch_add(1, Ordering::Relaxed);
-                            sh.storage_bytes.fetch_add(e.size, Ordering::Relaxed);
-                            ds[e.id()] =
-                                serde_json::json!({ "downloaded": true, "diskSize": e.size });
-                            got += 1;
-                            #[cfg(feature = "seed")]
-                            if let Some(sd) = &seeder_r {
-                                let _ = sd
-                                    .seed_file(&dest, &torrents_dir_r, Some(&e.info_hash), false)
-                                    .await;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if got > 0 {
-                    state::save_download_state(&ds);
-                    println!(
-                        "[masterlist] added {got} file(s) — now holding {} ({:.1}%)",
-                        sh.held.load(Ordering::Relaxed),
-                        sh.coverage_pct()
-                    );
-                }
-            }
-        });
-    }
-
     println!("[node] steady state — seeding + heartbeat + dashboard running. Ctrl-C to stop.");
     tokio::signal::ctrl_c().await.ok();
     println!("\n[node] shutting down.");

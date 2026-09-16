@@ -1,6 +1,6 @@
 [package]
 name = "sermonindex-node"
-version = "0.2.1"
+version = "0.2.3"
 edition = "2021"
 description = "SermonIndex headless seed node — download, hold, and seed the sermon archive with an optional built-in dashboard."
 authors = ["SermonIndex"]
@@ -27,6 +27,9 @@ hex = "0.4"
 dirs = "5"
 anyhow = "1"
 sysinfo = "0.32"
+# NAT-PMP / PCP port mapping. Same crate and version the desktop app uses, so
+# the two implementations cannot drift in behaviour.
+crab_nat = "0.2"
 futures-util = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
@@ -54,3 +57,10 @@ openssl = { version = "0.10", features = ["vendored"] }
 # Re-apply this patch when upgrading librqbit.
 [patch.crates-io]
 librqbit = { path = "vendor/librqbit" }
+
+# ── statvfs, Unix only ───────────────────────────────────────────────────────
+# Free space on the mount the LIBRARY lives on. sysinfo reports per-disk totals,
+# which is the wrong granularity: the library is usually on /mnt/library or an
+# external drive, and how much room / has is irrelevant to a node writing there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

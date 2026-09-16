@@ -119,3 +119,39 @@ fn cpu_temp_c() -> Option<f32> {
     let milli: f32 = raw.trim().parse().ok()?;
     Some((milli / 1000.0 * 10.0).round() / 10.0)
 }
+
+/// Free bytes on the filesystem holding `path`, or 0 when it cannot be read.
+///
+/// `sysinfo` reports per-DISK totals, which is the wrong granularity here — the
+/// library often lives on a mount that is not the disk sysinfo names first, and
+/// a node writing to /mnt/library does not care how much room / has. statvfs is
+/// the question actually being asked: how much can I write HERE.
+pub fn free_bytes(path: &std::path::Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        // Walk up to the nearest existing ancestor: the library folder may not
+        // have been created yet when this is first asked.
+        let mut p = path.to_path_buf();
+        while !p.exists() {
+            match p.parent() {
+                Some(par) => p = par.to_path_buf(),
+                None => return 0,
+            }
+        }
+        let Ok(c) = CString::new(p.as_os_str().as_bytes()) else { return 0 };
+        unsafe {
+            let mut st: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(c.as_ptr(), &mut st) == 0 {
+                return (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+            }
+        }
+        0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0
+    }
+}

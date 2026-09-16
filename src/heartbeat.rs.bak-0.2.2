@@ -167,12 +167,6 @@ pub async fn beat(
     // upsert overwrites node_type from this field each beat, so we must keep
     // sending "seed" for as long as the admin grant stands, else it reverts.
     let node_type = if seed_granted { "seed" } else { "user" };
-    // The port the session really bound (0 = not seeding → report the default,
-    // which is the only port anyone could have forwarded anyway).
-    let listen_port = match shared.listen_port.load(Ordering::Relaxed) {
-        0 => LISTEN_PORT_START,
-        p => p as u16,
-    };
     // Global IPv6 (if any) so the map server can probe inbound reachability and
     // light this node green/blue without any router port-forward. Cheap to
     // recompute each beat (no packets are sent) and it tracks address changes.
@@ -197,28 +191,18 @@ pub async fn beat(
         "storage_used_bytes": shared.storage_bytes.load(Ordering::Relaxed),
         "uploaded_bytes": shared.uploaded_bytes.load(Ordering::Relaxed),
         "peers_connected": shared.peers.load(Ordering::Relaxed),
-        // Direction. `peers_connected` is a bare total and cannot distinguish
-        // "people are taking sermons from me" from "I am taking from them" —
-        // which is the whole question a node operator has. `peers_in` counts
-        // peers that DIALLED US (proof we are serving); `peers_in_peak` is the
-        // high-water mark for this run, because the instantaneous figure drops
-        // to 0 every time the live window rotates away and a momentary 0 was
-        // being read as "you have helped nobody".
-        "peers_in": shared.peers_in.load(Ordering::Relaxed),
-        "peers_out": shared.peers_out.load(Ordering::Relaxed),
-        "peers_in_peak": shared.peers_in_peak.load(Ordering::Relaxed),
         "uptime_seconds": shared.started.elapsed().as_secs(),
         // Scheduled quiet hours in effect right now (church livestream etc.) —
         // the node is online and heartbeating but intentionally not serving.
         // Lets the admin dashboard show "quiet" instead of a worrying idle.
         "quiet": shared.quiet.load(Ordering::Relaxed),
-        "tcp_listen_port": listen_port,
+        "tcp_listen_port": LISTEN_PORT_START,
         "public_ipv6": public_ipv6,
         "reachable": reachable_json,
         "lat": g.get("lat"), "lon": g.get("lon"),
         "city": g.get("city"), "region": g.get("region"), "country": g.get("country"),
         "p2p_status": {
-            "tcp_listen_port": listen_port,
+            "tcp_listen_port": LISTEN_PORT_START,
             "torrent_count": shared.torrents.load(Ordering::Relaxed),
             "peer_count": shared.peers.load(Ordering::Relaxed),
             "uptime": shared.started.elapsed().as_secs(),

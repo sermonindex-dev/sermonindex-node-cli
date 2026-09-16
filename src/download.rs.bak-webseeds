@@ -1,4 +1,4 @@
-//! Resumable, size-verified HTTP download of a single file from its webseeds —
+//! Resumable, size-verified HTTP download of a single file from its CDN webseed.
 //! Streams to `<file>.part`, resumes with a Range header, and only renames into
 //! place when the on-disk size exactly matches the signed master-list size.
 
@@ -10,11 +10,6 @@ use tokio::io::AsyncWriteExt;
 /// Outcome of attempting one file.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
-    /// The disk is full. Distinct from a plain failure because the caller must
-    /// STOP rather than try the next file: without this, a full drive produced
-    /// one failure line per remaining file — tens of thousands of them — and
-    /// the one line that mattered scrolled away in seconds.
-    NoSpace,
     Skipped,     // already present and correct size
     Downloaded,  // fetched fresh (or resumed) successfully
     Failed,      // gave up after retries
@@ -71,20 +66,6 @@ pub async fn ensure_file(
                 Ok(false) => { /* size mismatch, try the next source */ }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    // A full disk is not a source problem and no other source
-                    // will fix it. Report it as its own outcome so the caller
-                    // can stop the whole pass — retrying every remaining file
-                    // against every mirror just buries the one line that says
-                    // what is actually wrong.
-                    let low = msg.to_lowercase();
-                    if low.contains("no space left")
-                        || low.contains("os error 28")
-                        || low.contains("disk full")
-                        || low.contains("quota exceeded")
-                    {
-                        eprintln!("[download] DISK FULL while writing {}", dest.display());
-                        return Ok(Outcome::NoSpace);
-                    }
                     // A 404 or 403 will say the same thing every time. Retrying
                     // it just delays the source that would have worked.
                     if msg.contains("permanent HTTP") {

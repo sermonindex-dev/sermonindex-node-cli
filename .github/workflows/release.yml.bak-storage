@@ -70,10 +70,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.label }}
-          # These exist only to hand the binaries to the publish job in this same
-          # run; the durable copies are the GitHub release and the CDN. Without
-          # this they defaulted to 90 days and accumulated on every tag.
-          retention-days: 1
           path: target/${{ matrix.target }}/release/sermonindex-node
           if-no-files-found: error
 

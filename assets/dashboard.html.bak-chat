@@ -69,23 +69,6 @@ body.compact #stage{transform:none!important}
 .nrow .nd{width:8px;height:8px;border-radius:50%;flex:none}
 .nrow .nm{font-weight:700;color:var(--ink)}.nrow .nc{color:var(--muted);flex:1}
 .nrow .nv{color:var(--goldtext);font-weight:700;font-variant-numeric:tabular-nums}
-
-/* ── Community (read only) ── */
-.chat-scroll{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:7px;padding-right:4px}
-.chat-empty{opacity:.55;text-align:center;padding:40px 12px;font-size:.8rem}
-.chat-day{text-align:center;font-size:.6rem;letter-spacing:.8px;text-transform:uppercase;
-  opacity:.45;margin:4px 0 1px}
-.chat-msg{background:var(--card,rgba(255,255,255,.04));border:1px solid var(--line,rgba(255,255,255,.08));
-  border-radius:10px 10px 10px 3px;padding:6px 10px 7px}
-.chat-msg.same{border-radius:10px;margin-top:-4px}
-.chat-msg.mod{background:rgba(212,175,55,.10);border-color:rgba(212,175,55,.34)}
-.chat-head{display:flex;align-items:baseline;gap:7px;margin-bottom:2px}
-.chat-head b{font-size:.78rem;color:var(--goldtext)}
-.chat-badge{font-size:.52rem;font-weight:700;letter-spacing:.5px;padding:1px 5px;border-radius:7px;
-  background:rgba(212,175,55,.22);color:var(--goldtext)}
-.chat-id{font-family:ui-monospace,monospace;font-size:.56rem;opacity:.5}
-.chat-t{margin-left:auto;font-size:.58rem;opacity:.55}
-.chat-body{font-size:.76rem;line-height:1.45;white-space:pre-wrap;word-break:break-word;opacity:.92}
 </style></head><body>
 <div id="stage">
 <div class="top">
@@ -103,14 +86,12 @@ body.compact #stage{transform:none!important}
   <div class="page" id="p_net"></div>
   <div class="page" id="p_node"></div>
   <div class="page" id="p_sys"></div>
-  <div class="page" id="p_chat"></div>
 </div>
 <div class="nav">
   <button class="on" data-p="map">Map</button>
   <button data-p="net">Network</button>
   <button data-p="node">Stats</button>
   <button data-p="sys">System</button>
-  <button data-p="chat">Community</button>
 </div>
 </div>
 <script>
@@ -359,18 +340,6 @@ function render(){
          '<div style="flex:1">'+dirBars(S.history||[])+'</div></div>'+
      '</div>';
   }
-  if(p==='chat'){
-    // Poll lazily — only while this page is the one on screen.
-    chatPoll();
-    $('#p_chat').innerHTML=
-     '<div class="card" style="height:100%;display:flex;flex-direction:column;overflow:hidden">'+
-       '<div class="mini" style="flex-shrink:0;margin-bottom:6px">Community · read only — post from the desktop app</div>'+
-       '<div class="chat-scroll" id="chatscroll">'+chatHtml()+'</div>'+
-     '</div>';
-    // Pin to the newest message. Chat reads bottom-up; a kiosk nobody touches
-    // must show the latest, not the oldest.
-    var cs=$('#chatscroll'); if(cs) cs.scrollTop=cs.scrollHeight;
-  }
   if(p==='sys'){
     var memPct=sy.mem_total?100*sy.mem_used/sy.mem_total:0,dPct=sy.disk_total?100*sy.disk_used/sy.disk_total:0;
     $('#p_sys').innerHTML=
@@ -389,77 +358,6 @@ async function tick(){
   var d=new Date();$('#clock').textContent=(''+d.getHours()).padStart(2,'0')+':'+(''+d.getMinutes()).padStart(2,'0');
   render();
 }
-
-// ── Community chat, READ ONLY ────────────────────────────────────────────────
-//
-// The same feed the desktop app's Community page shows, on the node's own
-// screen. Worth having: a Pi in a church cupboard is usually the machine whose
-// owner is LEAST likely to have the desktop app open, and it is the one whose
-// owner most needs to see "your region now has four nodes" or a moderator
-// saying the tracker is moving.
-//
-// READ ONLY, and that is a decision rather than an omission. This dashboard
-// binds 0.0.0.0:8137 with no authentication of any kind — by design, so anyone
-// on the house or church network can glance at it. Adding a POST box would mean
-// anyone who can reach that LAN (guest wifi included) could post to the GLOBAL
-// SermonIndex chat carrying this node's identity, with no password and no way
-// for the operator to know it happened. A viewer is a fine thing to hand the
-// whole building. A publisher is not. Posting stays in the desktop app, where
-// there is a person and a chosen display name.
-//
-// Polls on the 4-second dashboard tick but at most every 20s, and only while
-// the Community page is actually showing — a kiosk left on the Map page all
-// week costs the chat server nothing.
-var CHAT_API='https://community-chat-z71kj.bunny.run/';
-var CHAT={msgs:[],at:0,err:null,loaded:false};
-async function chatPoll(){
-  if(Date.now()-CHAT.at<20000) return;
-  CHAT.at=Date.now();
-  try{
-    var r=await fetch(CHAT_API+'?since=0',{cache:'no-store'});
-    if(!r.ok) throw 0;
-    var j=await r.json();
-    var list=Array.isArray(j)?j:(j.messages||j.msgs||[]);
-    CHAT.msgs=list.slice(-40); CHAT.err=null; CHAT.loaded=true;
-  }catch(e){
-    // Offline, blocked, or CORS. Say so plainly rather than showing an empty
-    // room, which reads as "nobody is talking" and is a different claim.
-    CHAT.err='Chat unavailable — the node may be offline, or the chat server is down.';
-    CHAT.loaded=true;
-  }
-}
-function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,function(c){
-  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
-function chatTime(ts){var d=new Date(Number(ts)||0);
-  return (''+d.getHours()).padStart(2,'0')+':'+(''+d.getMinutes()).padStart(2,'0');}
-function chatDay(ts){var d=new Date(Number(ts)||0),t=new Date(),y=new Date();y.setDate(t.getDate()-1);
-  if(d.toDateString()===t.toDateString())return 'Today';
-  if(d.toDateString()===y.toDateString())return 'Yesterday';
-  try{return d.toLocaleDateString(undefined,{weekday:'long',day:'numeric',month:'short'});}catch(e){return d.toDateString();}}
-function chatHtml(){
-  if(CHAT.err) return '<div class="chat-empty">'+esc(CHAT.err)+'</div>';
-  if(!CHAT.loaded) return '<div class="chat-empty">Loading the conversation…</div>';
-  if(!CHAT.msgs.length) return '<div class="chat-empty">No messages yet.</div>';
-  var out='',prevDay='',prevNode='';
-  for(var i=0;i<CHAT.msgs.length;i++){
-    var m=CHAT.msgs[i],day=chatDay(m.ts);
-    if(day!==prevDay){out+='<div class="chat-day">'+esc(day)+'</div>';prevDay=day;prevNode='';}
-    var mod=m.is_moderator===true;
-    // Same grouping rule as the desktop app: a run from one person is one
-    // block, not a stack of identical headers.
-    var same=String(m.node)===prevNode; prevNode=String(m.node);
-    out+='<div class="chat-msg'+(mod?' mod':'')+(same?' same':'')+'">';
-    if(!same){
-      out+='<div class="chat-head"><b>'+esc(m.name)+'</b>'
-         + (mod?'<span class="chat-badge">MOD</span>':'')
-         + '<span class="chat-id">#'+esc(m.node)+'</span>'
-         + '<span class="chat-t">'+chatTime(m.ts)+'</span></div>';
-    }
-    out+='<div class="chat-body">'+esc(m.text)+'</div></div>';
-  }
-  return out;
-}
-
 // kiosk lockdown: no context menu, no gesture zoom, no multi-touch, no drag
 document.addEventListener('contextmenu',function(e){e.preventDefault()});
 document.addEventListener('dragstart',function(e){e.preventDefault()});

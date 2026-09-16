@@ -5,10 +5,6 @@
 /* palette copied from the SermonIndex Node Software (src/styles.css) */
 :root{--bg:#F8F8F2;--card:#fff;--tert:#F1F1E8;--edge:#DEE2E6;--edge2:#c9cdb9;
  --ink:#242424;--ink2:#555;--muted:#888;--gold:#D4AF37;--goldtext:#967d1f;
-  /* Validated categorical pair for the direction chart. Deliberately NOT the
-     app's green/gold, which separates by only DeltaE 3.1 under protanopia —
-     effectively one colour for a red-green colour-blind reader. */
-  --dirin:#3987e5; --dirout:#c98500;
  --olive:#707035;--olive2:#908F51;--tan:#D9CDB6;--green:#3d8a41;--red:#e74c3c;
  --seedblue:#2d6cb5;--peer:#f8d355;--header:#707035;--headertext:#F8F8F2}
 html[data-theme='dark']{--bg:#1a1a1a;--card:#1e1e1e;--tert:#262620;--edge:#3a3a3a;--edge2:#444;
@@ -69,23 +65,6 @@ body.compact #stage{transform:none!important}
 .nrow .nd{width:8px;height:8px;border-radius:50%;flex:none}
 .nrow .nm{font-weight:700;color:var(--ink)}.nrow .nc{color:var(--muted);flex:1}
 .nrow .nv{color:var(--goldtext);font-weight:700;font-variant-numeric:tabular-nums}
-
-/* ── Community (read only) ── */
-.chat-scroll{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:7px;padding-right:4px}
-.chat-empty{opacity:.55;text-align:center;padding:40px 12px;font-size:.8rem}
-.chat-day{text-align:center;font-size:.6rem;letter-spacing:.8px;text-transform:uppercase;
-  opacity:.45;margin:4px 0 1px}
-.chat-msg{background:var(--card,rgba(255,255,255,.04));border:1px solid var(--line,rgba(255,255,255,.08));
-  border-radius:10px 10px 10px 3px;padding:6px 10px 7px}
-.chat-msg.same{border-radius:10px;margin-top:-4px}
-.chat-msg.mod{background:rgba(212,175,55,.10);border-color:rgba(212,175,55,.34)}
-.chat-head{display:flex;align-items:baseline;gap:7px;margin-bottom:2px}
-.chat-head b{font-size:.78rem;color:var(--goldtext)}
-.chat-badge{font-size:.52rem;font-weight:700;letter-spacing:.5px;padding:1px 5px;border-radius:7px;
-  background:rgba(212,175,55,.22);color:var(--goldtext)}
-.chat-id{font-family:ui-monospace,monospace;font-size:.56rem;opacity:.5}
-.chat-t{margin-left:auto;font-size:.58rem;opacity:.55}
-.chat-body{font-size:.76rem;line-height:1.45;white-space:pre-wrap;word-break:break-word;opacity:.92}
 </style></head><body>
 <div id="stage">
 <div class="top">
@@ -103,14 +82,12 @@ body.compact #stage{transform:none!important}
   <div class="page" id="p_net"></div>
   <div class="page" id="p_node"></div>
   <div class="page" id="p_sys"></div>
-  <div class="page" id="p_chat"></div>
 </div>
 <div class="nav">
   <button class="on" data-p="map">Map</button>
   <button data-p="net">Network</button>
   <button data-p="node">Stats</button>
   <button data-p="sys">System</button>
-  <button data-p="chat">Community</button>
 </div>
 </div>
 <script>
@@ -185,54 +162,6 @@ function legend(){return '<div class="maplegend">'+
   '<span><i style="background:'+NC.seed+'"></i>Seed</span>'+
   '<span><i style="background:'+NC.node+'"></i>Online</span>'+
   '<span><i style="background:'+NC.peer+'"></i>Peer</span></div>';}
-
-// ── dirBars: inbound vs outbound peer connections, one pair of bars per day ──
-//
-// The only chart here that answers the question a node operator actually has:
-// am I giving to this network, or only taking from it? A peer that DIALLED US
-// took something across a connection we never had to make — that is serving.
-// A peer we dialled proves our line works and nothing else.
-//
-// Grouped, not stacked: the two do not sum to anything meaningful, and the
-// comparison between them IS the message. One scale for both series, because
-// both are counts of peers — never a second y-axis.
-//
-// Colours are the validated blue/gold pair (see --dirin/--dirout below). The
-// app's own green/gold reads as one colour under protanopia, so it is not
-// reused here; the legend above names both series, so identity never rests on
-// colour alone.
-function dirBars(hist, h){
-  h = h || 72;
-  if(!hist || !hist.length) return '<div class="mini" style="opacity:.55;padding-top:22px;text-align:center">No record yet — this fills in as the node runs.</div>';
-  // history.jsonl is hourly; fold it into calendar days, keeping each day's
-  // PEAK. The live figure drops to 0 every time the seeding rotation moves off
-  // the torrents those peers were on, so a day when twenty people took sermons
-  // could otherwise be written down as a zero.
-  var byDay={}, order=[];
-  for(var i=0;i<hist.length;i++){
-    var r=hist[i]; if(!r||!r.ts) continue;
-    var d=new Date(r.ts*1000), k=d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate();
-    if(!byDay[k]){byDay[k]={inb:0,out:0,lbl:d.toLocaleDateString(undefined,{day:'numeric',month:'short'})};order.push(k);}
-    byDay[k].inb=Math.max(byDay[k].inb, r.peers_in_peak!=null?r.peers_in_peak:(r.peers_in||0));
-    byDay[k].out=Math.max(byDay[k].out, r.peers_out||0);
-  }
-  order=order.slice(-7);
-  if(!order.length) return '<div class="mini" style="opacity:.55;padding-top:22px;text-align:center">No record yet.</div>';
-  var max=1;
-  for(var j=0;j<order.length;j++){var v=byDay[order[j]];if(v.inb>max)max=v.inb;if(v.out>max)max=v.out;}
-  var W=100, PB=14, plot=h-PB, slot=W/order.length, bw=Math.max(1.4,(slot-4)/2-0.6);
-  var out='<svg viewBox="0 0 '+W+' '+h+'" preserveAspectRatio="none" style="width:100%;height:100%;display:block">';
-  out+='<line x1="0" y1="'+plot+'" x2="'+W+'" y2="'+plot+'" stroke="currentColor" stroke-opacity=".18" stroke-width=".4" vector-effect="non-scaling-stroke"/>';
-  for(var k2=0;k2<order.length;k2++){
-    var row=byDay[order[k2]], x=k2*slot+2;
-    var hi=(row.inb/max)*plot, ho=(row.out/max)*plot;
-    if(hi>0) out+='<rect x="'+x+'" y="'+(plot-hi)+'" width="'+bw+'" height="'+hi+'" rx="1" fill="var(--dirin)"/>';
-    if(ho>0) out+='<rect x="'+(x+bw+1.2)+'" y="'+(plot-ho)+'" width="'+bw+'" height="'+ho+'" rx="1" fill="var(--dirout)"/>';
-    out+='<text x="'+(k2*slot+slot/2)+'" y="'+(h-3)+'" text-anchor="middle" font-size="6" fill="currentColor" fill-opacity=".5">'+row.lbl+'</text>';
-  }
-  return out+'</svg>';
-}
-
 // Bind a handler for BOTH mouse and touch. A touchscreen kiosk browser does not
 // always synthesise a click from a tap, so binding onclick alone leaves the
 // buttons dead on the panel while they still work in a desktop browser. touchend
@@ -348,28 +277,14 @@ function render(){
          '<div class="col" style="flex:1">'+
            '<div class="tiles">'+
              '<div class="card"><div class="lbl">Sermons held</div><div class="big">'+fn(n.held)+'</div><div class="sm">of '+fn(n.catalog||'—')+' in catalog</div></div>'+
-             '<div class="card"><div class="lbl">Peers served</div><div class="big" style="color:var(--dirin)">'+fn(n.peers_in_peak!=null?n.peers_in_peak:n.peers)+'</div><div class="sm">came to you · '+fn(n.peers)+' connected now</div></div>'+
+             '<div class="card"><div class="lbl">Peers</div><div class="big" style="color:var(--green)">'+fn(n.peers)+'</div><div class="sm">connected now</div></div>'+
              '<div class="card"><div class="lbl">Uploading</div><div class="big" style="color:var(--seedblue)">'+fbps(sy.up_bps)+'</div><div class="sm">to the swarm</div></div>'+
              '<div class="card"><div class="lbl">Library size</div><div class="big">'+fb(sy.disk_used)+'</div><div class="sm">uptime '+fdur(n.uptime_s)+'</div></div>'+
            '</div>'+
          '</div>'+
        '</div>'+
-       '<div class="card" style="height:96px;display:flex;flex-direction:column">'+
-         '<div class="mini">Peer connections · <b style="color:var(--dirin)">\u25a0 came to you</b> &nbsp; <b style="color:var(--dirout)">\u25a0 you reached out</b> &nbsp;·&nbsp; last 7 days</div>'+
-         '<div style="flex:1">'+dirBars(S.history||[])+'</div></div>'+
+       '<div class="card" style="height:96px;display:flex;flex-direction:column"><div class="mini">This node · upload throughput · last 3 min</div><div style="flex:1">'+spark(tr.up_bps,'--goldtext',fbps,72)+'</div></div>'+
      '</div>';
-  }
-  if(p==='chat'){
-    // Poll lazily — only while this page is the one on screen.
-    chatPoll();
-    $('#p_chat').innerHTML=
-     '<div class="card" style="height:100%;display:flex;flex-direction:column;overflow:hidden">'+
-       '<div class="mini" style="flex-shrink:0;margin-bottom:6px">Community · read only — post from the desktop app</div>'+
-       '<div class="chat-scroll" id="chatscroll">'+chatHtml()+'</div>'+
-     '</div>';
-    // Pin to the newest message. Chat reads bottom-up; a kiosk nobody touches
-    // must show the latest, not the oldest.
-    var cs=$('#chatscroll'); if(cs) cs.scrollTop=cs.scrollHeight;
   }
   if(p==='sys'){
     var memPct=sy.mem_total?100*sy.mem_used/sy.mem_total:0,dPct=sy.disk_total?100*sy.disk_used/sy.disk_total:0;
@@ -389,77 +304,6 @@ async function tick(){
   var d=new Date();$('#clock').textContent=(''+d.getHours()).padStart(2,'0')+':'+(''+d.getMinutes()).padStart(2,'0');
   render();
 }
-
-// ── Community chat, READ ONLY ────────────────────────────────────────────────
-//
-// The same feed the desktop app's Community page shows, on the node's own
-// screen. Worth having: a Pi in a church cupboard is usually the machine whose
-// owner is LEAST likely to have the desktop app open, and it is the one whose
-// owner most needs to see "your region now has four nodes" or a moderator
-// saying the tracker is moving.
-//
-// READ ONLY, and that is a decision rather than an omission. This dashboard
-// binds 0.0.0.0:8137 with no authentication of any kind — by design, so anyone
-// on the house or church network can glance at it. Adding a POST box would mean
-// anyone who can reach that LAN (guest wifi included) could post to the GLOBAL
-// SermonIndex chat carrying this node's identity, with no password and no way
-// for the operator to know it happened. A viewer is a fine thing to hand the
-// whole building. A publisher is not. Posting stays in the desktop app, where
-// there is a person and a chosen display name.
-//
-// Polls on the 4-second dashboard tick but at most every 20s, and only while
-// the Community page is actually showing — a kiosk left on the Map page all
-// week costs the chat server nothing.
-var CHAT_API='https://community-chat-z71kj.bunny.run/';
-var CHAT={msgs:[],at:0,err:null,loaded:false};
-async function chatPoll(){
-  if(Date.now()-CHAT.at<20000) return;
-  CHAT.at=Date.now();
-  try{
-    var r=await fetch(CHAT_API+'?since=0',{cache:'no-store'});
-    if(!r.ok) throw 0;
-    var j=await r.json();
-    var list=Array.isArray(j)?j:(j.messages||j.msgs||[]);
-    CHAT.msgs=list.slice(-40); CHAT.err=null; CHAT.loaded=true;
-  }catch(e){
-    // Offline, blocked, or CORS. Say so plainly rather than showing an empty
-    // room, which reads as "nobody is talking" and is a different claim.
-    CHAT.err='Chat unavailable — the node may be offline, or the chat server is down.';
-    CHAT.loaded=true;
-  }
-}
-function esc(t){return String(t==null?'':t).replace(/[&<>"]/g,function(c){
-  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
-function chatTime(ts){var d=new Date(Number(ts)||0);
-  return (''+d.getHours()).padStart(2,'0')+':'+(''+d.getMinutes()).padStart(2,'0');}
-function chatDay(ts){var d=new Date(Number(ts)||0),t=new Date(),y=new Date();y.setDate(t.getDate()-1);
-  if(d.toDateString()===t.toDateString())return 'Today';
-  if(d.toDateString()===y.toDateString())return 'Yesterday';
-  try{return d.toLocaleDateString(undefined,{weekday:'long',day:'numeric',month:'short'});}catch(e){return d.toDateString();}}
-function chatHtml(){
-  if(CHAT.err) return '<div class="chat-empty">'+esc(CHAT.err)+'</div>';
-  if(!CHAT.loaded) return '<div class="chat-empty">Loading the conversation…</div>';
-  if(!CHAT.msgs.length) return '<div class="chat-empty">No messages yet.</div>';
-  var out='',prevDay='',prevNode='';
-  for(var i=0;i<CHAT.msgs.length;i++){
-    var m=CHAT.msgs[i],day=chatDay(m.ts);
-    if(day!==prevDay){out+='<div class="chat-day">'+esc(day)+'</div>';prevDay=day;prevNode='';}
-    var mod=m.is_moderator===true;
-    // Same grouping rule as the desktop app: a run from one person is one
-    // block, not a stack of identical headers.
-    var same=String(m.node)===prevNode; prevNode=String(m.node);
-    out+='<div class="chat-msg'+(mod?' mod':'')+(same?' same':'')+'">';
-    if(!same){
-      out+='<div class="chat-head"><b>'+esc(m.name)+'</b>'
-         + (mod?'<span class="chat-badge">MOD</span>':'')
-         + '<span class="chat-id">#'+esc(m.node)+'</span>'
-         + '<span class="chat-t">'+chatTime(m.ts)+'</span></div>';
-    }
-    out+='<div class="chat-body">'+esc(m.text)+'</div></div>';
-  }
-  return out;
-}
-
 // kiosk lockdown: no context menu, no gesture zoom, no multi-touch, no drag
 document.addEventListener('contextmenu',function(e){e.preventDefault()});
 document.addEventListener('dragstart',function(e){e.preventDefault()});

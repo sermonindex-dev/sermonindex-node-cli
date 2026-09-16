@@ -17,17 +17,11 @@ pub const PROBE_API: &str = "https://app-endpoints-gkb5p.bunny.run";
 pub const MASTER_LIST_URL: &str = "https://sermonindex1.b-cdn.net/torrents/master-list.json";
 pub const APP_VERSION: &str = concat!("cli-", env!("CARGO_PKG_VERSION"));
 
-/// Release index for the headless node.
-///
-/// This is the file `publish-node-cli.sh` ALREADY writes and already purges on
-/// every release, and the same one `/node-software/` renders its download list
-/// from. Pointing the update check at it means publishing a release is exactly
-/// the one command it has always been — no second manifest to remember, and no
-/// way for the two to disagree about what the newest version is.
-///
-/// Shape: { "releases": [ { "version": "v0.2.3", "date": …, "url": …, … }, … ] }
-/// newest first, versions carrying a leading "v".
-pub const MANIFEST_URL: &str = "https://sermonindex4.b-cdn.net/node-cli/releases/releases.json";
+/// Release manifest for the headless node. Sibling of the desktop app's
+/// updater endpoint (`/app/latest.json`) on the same zone, so publishing a CLI
+/// release is the same operation as publishing an app release.
+/// Shape: { "version": "0.2.2", "notes": "...", "pub_date": "..." }
+pub const MANIFEST_URL: &str = "https://sermonindex4.b-cdn.net/app/cli-latest.json";
 
 /// How often to re-read the signed master list looking for newly published
 /// sermons. Before 0.2.2 it was read exactly once, at startup — so a node that
@@ -179,12 +173,10 @@ pub fn max_peers_per_torrent(settings: &Value) -> usize {
 /// real RAM, exactly what melted the Pi. Nodes holding fewer files than the
 /// window are unaffected: everything stays live and rotation is a no-op.
 pub fn active_torrents(settings: &Value) -> usize {
-    match settings.get("active_torrents").and_then(|v| v.as_u64()) {
-        Some(n) => n as usize,
-        // Unset now means "pick for this machine" rather than a flat 2000 that
-        // was chosen for the smallest one. See active_torrents_default().
-        None => active_torrents_default(),
-    }
+    settings
+        .get("active_torrents")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2000) as usize
 }
 
 /// Minutes each rotation window stays live before advancing (default 15,
@@ -411,197 +403,5 @@ fn getrandom(buf: &mut [u8]) {
         x ^= x >> 7;
         x ^= x << 17;
         *b = (x & 0xff) as u8;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 0.2.3 — settings the desktop app has always written and the CLI never read
-//
-// The two programs share ~/.sermonindex/settings.json. Until now the CLI read
-// most of it but silently ignored these three, so a person who set them in the
-// GUI and then ran a headless node got a node that quietly did something else.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Monthly upload ceiling in BYTES, or None for unlimited.
-///
-/// The GUI has had this under Settings → Seeding Schedule & Limits since
-/// forever; the CLI ignored it completely. That is the wrong way round: the
-/// desktop app runs on a machine with somebody sitting at it who would notice a
-/// data bill, and the headless node is the one on a church's metered connection
-/// with nobody watching it at all.
-pub fn monthly_cap_bytes(settings: &Value) -> Option<u64> {
-    if !settings.get("monthly_cap_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return None;
-    }
-    settings
-        .get("monthly_cap_gb")
-        .and_then(|v| v.as_f64())
-        .filter(|g| *g > 0.0)
-        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as u64)
-}
-
-/// Is BitTorrent enabled at all? Default TRUE.
-///
-/// False = download and hold, never serve. Previously only reachable by
-/// recompiling with `--no-default-features`, which is not a thing you can ask a
-/// volunteer to do over the phone.
-pub fn p2p_enabled(settings: &Value) -> bool {
-    settings.get("p2p_enabled").and_then(|v| v.as_bool()).unwrap_or(true)
-}
-
-/// Where HTTP fallbacks are fetched from: "cdn" (default) or "archive".
-///
-/// The master list carries both for nearly every file, Archive first. This only
-/// changes which one the node PREFERS; the other stays as the fallback, so a
-/// wrong answer here costs a little speed and never availability.
-pub fn content_mode(settings: &Value) -> String {
-    match settings.get("content_mode").and_then(|v| v.as_str()) {
-        Some("archive") => "archive".to_string(),
-        _ => "cdn".to_string(),
-    }
-}
-
-/// Total installed RAM in GB, for the tuning defaults below.
-pub fn total_ram_gb() -> f64 {
-    use sysinfo::System;
-    let mut s = System::new();
-    s.refresh_memory();
-    s.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0
-}
-
-/// Per-torrent CONNECTION cap, scaled to the machine.
-///
-/// Not to be confused with `max_peers_per_torrent`, which caps the map of
-/// DISCOVERED addresses inside vendored librqbit. This is the number of live
-/// connections a single torrent may hold, and librqbit applies it per torrent
-/// with no session-wide ceiling — so at ~25,500 torrents it is the only thing
-/// bounding total peer state.
-///
-/// 8 was measured on a 4 GB Pi, where 24 walked the resident set from 1.1 GB at
-/// 11 peers to 3.1 GB at 79 and then out of memory. That number has since been
-/// applied to every machine, including a Mac mini M4 with 16 GB doing nothing
-/// else — which is simply leaving capacity on the floor. The Pi keeps its 8.
-pub fn peer_limit_per_torrent(settings: &Value) -> usize {
-    if let Some(n) = settings.get("peer_limit_per_torrent").and_then(|v| v.as_u64()) {
-        return (n as usize).clamp(2, 200);
-    }
-    let gb = total_ram_gb();
-    if gb >= 15.0 {
-        32
-    } else if gb >= 7.0 {
-        16
-    } else {
-        8
-    }
-}
-
-/// Default live-window size, scaled the same way. Explicit `active_torrents`
-/// always wins; this only changes what "unset" means.
-pub fn active_torrents_default() -> usize {
-    let gb = total_ram_gb();
-    if gb >= 15.0 {
-        8000
-    } else if gb >= 7.0 {
-        4000
-    } else {
-        2000
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// `shard_for` decides the on-disk folder for every single file in the
-    /// library. One wrong character and 30,000 files silently relocate: the
-    /// node then reports 0% coverage, re-downloads 412 GB it already has, and
-    /// nothing anywhere logs an error — it just looks like a node that never
-    /// finished. Worth a test.
-    #[test]
-    fn shard_is_stable_and_two_chars() {
-        for name in [
-            "gGl7g6A_0WI-IeZJ.mp3",
-            "xuD_ySQ8N_bIgByN.mp4",
-            "A.mp3",
-            "",
-            "_-.mp3",
-            "ÉÀ-accented.mp3",
-        ] {
-            let a = shard_for(name);
-            assert_eq!(a, shard_for(name), "shard must be deterministic: {name:?}");
-            assert_eq!(a.chars().count(), 2, "shard must be 2 chars: {name:?} -> {a:?}");
-        }
-        // Different names with the same prefix share a shard; that is the point.
-        assert_eq!(shard_for("abZZ.mp3"), shard_for("abYY.mp3"));
-        assert_ne!(shard_for("abZZ.mp3"), shard_for("zzYY.mp3"));
-    }
-
-    #[test]
-    fn parses_times_and_days() {
-        assert_eq!(parse_hhmm("00:00"), Some(0));
-        assert_eq!(parse_hhmm("23:59"), Some(23 * 60 + 59));
-        assert_eq!(parse_hhmm("08:30"), Some(510));
-        assert_eq!(parse_hhmm("24:00"), None);
-        assert_eq!(parse_hhmm("8:30am"), None);
-        assert_eq!(parse_hhmm(""), None);
-        assert!(parse_days("sun").is_some());
-        assert!(parse_days("sun,wed").is_some());
-        assert!(parse_days("everyday").is_some());
-        assert!(parse_days("blursday").is_none());
-    }
-
-    /// A quiet window that crosses midnight is exactly where this kind of logic
-    /// breaks, and getting it wrong is not cosmetic: the node either seeds
-    /// straight through a church's livestream, or goes silent for 22 hours a day
-    /// and nobody can work out why its coverage never moves.
-    #[test]
-    fn quiet_window_crossing_midnight_is_handled() {
-        let s = json!({
-            "quiet_hours": [{ "days": ["sun"], "start": "22:00", "end": "02:00" }]
-        });
-        let w = quiet_windows(&s);
-        assert_eq!(w.len(), 1, "one window should parse");
-        let w = &w[0];
-        assert!(
-            w.start > w.end,
-            "22:00-02:00 must be stored as a wrapping window (start {} > end {}), \
-             not silently normalised into an empty one",
-            w.start, w.end
-        );
-        // An empty schedule is never quiet, whatever the clock says.
-        assert!(quiet_now(&json!({})).is_none());
-        assert!(quiet_now(&json!({ "quiet_hours": [] })).is_none());
-    }
-
-    #[test]
-    fn upload_cap_needs_both_switch_and_value() {
-        assert!(upload_limit_bps(&json!({})).is_none());
-        assert!(upload_limit_bps(&json!({ "upload_limit_kbps": 500 })).is_none(),
-                "a rate with the switch off must stay unlimited");
-        assert!(upload_limit_bps(&json!({ "upload_limit_enabled": true, "upload_limit_kbps": 0 })).is_none());
-        assert_eq!(
-            upload_limit_bps(&json!({ "upload_limit_enabled": true, "upload_limit_kbps": 500 })),
-            Some(512_000)
-        );
-    }
-
-    #[test]
-    fn monthly_cap_needs_both_too() {
-        assert!(monthly_cap_bytes(&json!({ "monthly_cap_gb": 500 })).is_none());
-        assert_eq!(
-            monthly_cap_bytes(&json!({ "monthly_cap_enabled": true, "monthly_cap_gb": 1 })),
-            Some(1_073_741_824)
-        );
-    }
-
-    #[test]
-    fn peer_limit_respects_an_explicit_setting_and_clamps_it() {
-        assert_eq!(peer_limit_per_torrent(&json!({ "peer_limit_per_torrent": 24 })), 24);
-        assert_eq!(peer_limit_per_torrent(&json!({ "peer_limit_per_torrent": 0 })), 2);
-        assert_eq!(peer_limit_per_torrent(&json!({ "peer_limit_per_torrent": 9999 })), 200);
-        // Unset scales to the machine; whatever it picks must be sane.
-        let auto = peer_limit_per_torrent(&json!({}));
-        assert!((8..=32).contains(&auto), "auto peer limit out of range: {auto}");
     }
 }

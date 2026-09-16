@@ -36,10 +36,14 @@ impl Entry {
             .map(|(s, _)| s)
             .unwrap_or(&self.name)
     }
-    /// Best HTTP download URL: the CDN webseed the master list ships per entry.
-    pub fn download_url(&self) -> Option<&str> {
-        self.webseeds.first().map(|s| s.as_str())
+    /// Every HTTP source for this file, in the master list's own order:
+    /// Archive.org first wherever a mirror exists, our CDN behind it. The
+    /// caller is expected to walk the list, not just take the head — a mirror
+    /// that is first is not a mirror that is always up, and Archive throttles.
+    pub fn download_urls(&self) -> &[String] {
+        &self.webseeds
     }
+
 }
 
 #[derive(Debug, Clone, Deserialize)]
