@@ -46,9 +46,44 @@ fn is_global_unicast_v6(ip: &Ipv6Addr) -> bool {
     (seg0 & 0xe000) == 0x2000 // global unicast 2000::/3
 }
 
+/// True when this peer address is a GLOBAL-unicast IPv6 address.
+///
+/// Scope is the whole point. A connection from `fe80::…` (link-local),
+/// `fc00::/7` (unique-local) or `::1` proves nothing about the internet — it is
+/// a machine on the same LAN, and counting it would tell someone they are
+/// reachable when they are not.
+///
+/// A v4-mapped address arriving on a dual-stack `[::]` listener is explicitly
+/// rejected: librqbit-dualstack-sockets normalises those back to `SocketAddr::V4`
+/// on accept, but we re-check rather than trust it.
+pub fn is_global_unicast_ipv6_peer(addr: &SocketAddr) -> bool {
+    match addr {
+        SocketAddr::V6(a) => {
+            let ip = *a.ip();
+            if ip.to_ipv4_mapped().is_some() {
+                return false;
+            }
+            is_global_unicast_v6(&ip)
+        }
+        SocketAddr::V4(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_scope_rejects_lan_and_mapped() {
+        let p = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert!(is_global_unicast_ipv6_peer(&p("[2001:569:5ab9:df00::1]:42800")));
+        assert!(!is_global_unicast_ipv6_peer(&p("[fe80::1]:42800")));
+        assert!(!is_global_unicast_ipv6_peer(&p("[fd12:3456::1]:42800")));
+        assert!(!is_global_unicast_ipv6_peer(&p("[::1]:42800")));
+        assert!(!is_global_unicast_ipv6_peer(&p("1.2.3.4:42800")));
+        // A v4-mapped peer on a dual-stack listener is IPv4, not IPv6 proof.
+        assert!(!is_global_unicast_ipv6_peer(&p("[::ffff:1.2.3.4]:42800")));
+    }
 
     #[test]
     fn classifies_v6_scopes() {

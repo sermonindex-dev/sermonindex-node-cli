@@ -3,3 +3,9 @@ dist/
 .DS_Store
 *.secrets.json
 secrets*.json
+
+# Editor/agent backups — never shippable, and publish-node-cli.sh tars the
+# working tree, so an uncommitted .bak can leak into a release.
+*.bak
+*.bak-*
+*.orig

@@ -104,6 +104,30 @@ pub fn run(args: &[String]) -> Result<()> {
                 s["seed_end"] = json!(b.trim());
             }
         }
+        "public-port" => {
+            if val == "off" || val == "0" || val == "auto" {
+                if let Some(o) = s.as_object_mut() { o.remove("public_port"); }
+                println!("Public port cleared — the node will announce whatever it binds,");
+                println!("or whatever NAT-PMP gives it.");
+            } else {
+                let n: u64 = val.parse().map_err(|_| anyhow::anyhow!("not a port: {val}"))?;
+                if !(1..=65535).contains(&n) {
+                    bail!("port must be 1-65535");
+                }
+                s["public_port"] = json!(n);
+                println!("Peers will be told to dial port {n}.");
+                println!("This is stamped into every announce when the node starts, so it");
+                println!("takes a restart — and the node must actually be reachable there.");
+            }
+        }
+        "public-ip" => {
+            if val == "off" || val == "auto" || val.is_empty() {
+                if let Some(o) = s.as_object_mut() { o.remove("public_ip"); }
+            } else {
+                s["public_ip"] = json!(val);
+            }
+        }
+        "natpmp" => s["natpmp_enabled"] = json!(on_off(val)?),
         "p2p" => s["p2p_enabled"] = json!(on_off(val)?),
         "dht" => s["dht_enabled"] = json!(on_off(val)?),
         "source" => match val {
@@ -231,6 +255,20 @@ fn show() -> Result<()> {
         }
     );
     println!("    quiet        {}", config::describe_quiet(&s));
+
+    println!("\n  Public reachability");
+    println!(
+        "    public-port  {}",
+        match config::public_port(&s) {
+            Some(p) => format!("{p}   (peers are told to dial this)"),
+            None => "auto — whatever we bind, or whatever NAT-PMP gives us".to_string(),
+        }
+    );
+    println!(
+        "    public-ip    {}",
+        config::public_ip(&s).unwrap_or_else(|| "auto — inferred from where our traffic arrives".to_string())
+    );
+    println!("    natpmp       {}", yn(config::natpmp_enabled(&s)));
 
     println!("\n  Content");
     println!("    scope        {}", config::seed_scope(&s));

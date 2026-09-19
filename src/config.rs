@@ -461,6 +461,160 @@ pub fn content_mode(settings: &Value) -> String {
     }
 }
 
+/// The port the outside world can reach this node on, when it differs from the
+/// port the node listens on locally.
+///
+/// THE PROBLEM THIS SOLVES
+///
+/// A node behind carrier-grade NAT — Starlink, T-Mobile Home Internet, most
+/// mobile broadband — can never be dialled on IPv4, however perfectly its owner
+/// configures their router, because the carrier shares one public address
+/// between many homes. There is no port to forward. Buying a static public IP
+/// is increasingly expensive where it is offered at all.
+///
+/// A VPN with port forwarding is the way through: the tunnel gives the node a
+/// real public address and one real public port. The catch is that the provider
+/// picks the port, it is effectively random, and it can change.
+///
+/// WHY A SEPARATE SETTING IS NEEDED
+///
+/// BitTorrent already has the mechanism for telling other peers where to find
+/// you — it is the `port=` field in a tracker announce and the `port` in a DHT
+/// `announce_peer`. What it does NOT assume is that this equals the port you
+/// bound locally. With a VPN they are different: librqbit listens on 42800 on
+/// the machine, while the world must dial 51413 on the VPN's exit address.
+/// librqbit models this as `ListenerOptions::announce_port`, and this setting
+/// is what fills it.
+///
+/// Set it to 0 or leave it unset for the normal case, where the two are the
+/// same. NAT-PMP (including Proton VPN's, inside the tunnel) fills it in
+/// automatically when it succeeds, so most people will never touch this.
+pub fn public_port(settings: &Value) -> Option<u16> {
+    // The environment wins, so a wrapper script that pulls the port from a VPN
+    // CLI can hand it over without rewriting anyone's settings file.
+    if let Ok(v) = std::env::var("SI_PUBLIC_PORT") {
+        if let Ok(p) = v.trim().parse::<u16>() {
+            if p > 0 {
+                return Some(p);
+            }
+        }
+    }
+    settings
+        .get("public_port")
+        .and_then(|v| v.as_u64())
+        .filter(|p| *p > 0 && *p <= 65535)
+        .map(|p| p as u16)
+}
+
+/// The port this node LISTENS on, when the user has pinned one.
+///
+/// Distinct from `public_port` above, and the distinction matters:
+///   • `listen_port` is the local socket this process binds.
+///   • `public_port` is the number peers are told to dial, which differs only
+///     when something upstream (a VPN, a carrier NAT) forwards a different one.
+///
+/// Why pin the listening port at all. By default `Seeder::start` walks
+/// LISTEN_PORT_START..=LISTEN_PORT_END and takes the first free one, which is
+/// fine when UPnP or NAT-PMP opens it automatically. When nothing does, the way
+/// in is a rule the operator writes by hand — an IPv4 port forward, or an IPv6
+/// firewall pinhole, which on most consumer routers is the ONLY way inbound
+/// IPv6 ever works. Such a rule names one port. A node that may land on any of
+/// forty matches it by luck and stops matching the first time something else
+/// holds that port at startup, leaving the operator unreachable with nothing in
+/// the logs that looks like a cause.
+///
+/// SI_LISTEN_PORT overrides settings.json, so a systemd unit or container can
+/// set it without owning the settings file.
+///
+/// Range: 1–65535. Below 1024 is privileged on Linux and macOS — a node run as
+/// a normal user cannot bind it and will fall back to the default range, which
+/// `Seeder::start` reports. Run as root (or grant CAP_NET_BIND_SERVICE) if you
+/// genuinely need a low port. There is no limit on which ports are "allowed";
+/// a node uses exactly one TCP port, and the only real constraints are the
+/// privileged range and whatever else already holds the port.
+pub fn listen_port(settings: &Value) -> Option<u16> {
+    if let Ok(v) = std::env::var("SI_LISTEN_PORT") {
+        if let Ok(p) = v.trim().parse::<u16>() {
+            if p > 0 {
+                return Some(p);
+            }
+        }
+    }
+    settings
+        .get("listen_port")
+        .and_then(|v| v.as_u64())
+        .filter(|p| *p > 0 && *p <= 65535)
+        .map(|p| p as u16)
+}
+
+/// The public address peers reach this node at, when we cannot infer it.
+///
+/// Almost always unnecessary: trackers and the DHT record the address a packet
+/// ARRIVED from, so a node whose traffic egresses through a tunnel is already
+/// advertised at the tunnel's address without telling anyone anything.
+///
+/// It exists for the reachability PROBE, which is a different question. The
+/// probe edge dials the address our request came from — correct when the
+/// heartbeat shares the tunnel, wrong when someone split-tunnels the torrent
+/// traffic and leaves everything else on the home connection. Then the probe
+/// tests the home address, finds it closed, and the node is drawn as a yellow
+/// peer while being perfectly reachable.
+pub fn public_ip(settings: &Value) -> Option<String> {
+    if let Ok(v) = std::env::var("SI_PUBLIC_IP") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    settings
+        .get("public_ip")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Ask NAT-PMP/PCP for a public port at startup (default TRUE).
+///
+/// This is what makes a Proton VPN setup work with no wrapper at all: Proton
+/// hands its forwarded port out over NAT-PMP on 10.2.0.1 inside the tunnel, so
+/// the node can simply ask for it.
+pub fn natpmp_enabled(settings: &Value) -> bool {
+    settings.get("natpmp_enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
+/// How recently an inbound connection must have arrived for this node to still
+/// count as reachable. Default 14 days.
+///
+/// WHY THIS EXISTS
+///
+/// Before 0.2.5, one inbound IPv6 connection made a node "reachable" for ever.
+/// That was the right fix for the previous problem — a badge that flickered
+/// between green and yellow every time the last peer disconnected was worse
+/// than one that lied — but it overshot badly. A node could show a confident
+/// green "full node" on the strength of a single connection a month earlier,
+/// with nothing since. That is not a claim about the present tense, and it was
+/// being read as one.
+///
+/// WHY A DATE AND NOT A RATE
+///
+/// The obvious alternative is a quota: so many inbound connections per day.
+/// That would be wrong. Inbound RATE measures swarm demand, not reachability —
+/// a perfectly reachable node in a quiet fortnight can legitimately receive
+/// nothing at all, and demoting it would punish exactly the households we most
+/// want to keep. A recency window absorbs a quiet stretch while still making
+/// "confirmed a month ago" unable to claim anything about today.
+///
+/// 14 days is deliberately generous as a starting point. Once history.jsonl has
+/// real data from real homes, this can be tightened with a settings change and
+/// no release.
+pub fn reach_confirm_days(settings: &Value) -> u64 {
+    settings
+        .get("reach_confirm_days")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(14)
+        .clamp(1, 365)
+}
+
 /// Total installed RAM in GB, for the tuning defaults below.
 pub fn total_ram_gb() -> f64 {
     use sysinfo::System;

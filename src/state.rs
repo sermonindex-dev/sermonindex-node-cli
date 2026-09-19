@@ -42,12 +42,29 @@ pub struct Shared {
     /// those peers were on; the previous UI read that momentary 0 as "you have
     /// helped nobody", which was simply wrong. This never decreases.
     pub peers_in_peak: AtomicU64,
+    /// STICKY: a peer at a global-unicast IPv6 address has dialled this node.
+    ///
+    /// Sticky on purpose, and persisted across restarts (see load/save_v6_proof).
+    /// Reachability is a "has this ever been demonstrated" fact, not a momentary
+    /// one — a probe can fail for reasons that have nothing to do with the
+    /// operator, a real inbound connection cannot. A flag that flickered off
+    /// every time the last peer disconnected would be worse than no flag.
+    pub v6_inbound_seen: AtomicBool,
+    /// When we first saw it (unix seconds), so the dashboard can date the claim
+    /// instead of stating a months-old fact in the present tense.
+    pub v6_inbound_at: AtomicU64,
     pub torrents: AtomicU64,
     /// The TCP port the seed session really bound (0 = not seeding). Set once
     /// at startup from `Seeder::port()`; everything that reports a port — the
     /// reachability probe, the heartbeat, /stats — must read THIS, never the
     /// LISTEN_PORT_START constant.
     pub listen_port: AtomicU64,
+    /// The port bound on this machine. Usually identical to `listen_port`; it
+    /// differs when a VPN or upstream NAT gives the node a different public
+    /// port. Kept separately so the dashboard can show both — "listening on
+    /// 42800, reachable as 51413" is a sentence somebody debugging a tunnel
+    /// needs, and collapsing the two loses it.
+    pub local_port: AtomicU64,
     pub seed_up_bps: AtomicU64, // from the torrent session (0 if seeding off)
     pub reachable: AtomicU8,    // 0 = unknown, 1 = reachable (v4 or v6), 2 = closed
     pub seed_granted: AtomicBool, // admin has flipped seed_access.enabled for us
@@ -76,6 +93,10 @@ pub struct Shared {
     /// owns a handle to it for the life of the process and writes the result of
     /// each attempt; `Shared` only ever reads it.
     pub natpmp: std::sync::Arc<Mutex<String>>,
+    /// A peer-check result waiting to ride along on the next heartbeat. Held
+    /// rather than posted immediately so the whole exchange costs no extra
+    /// requests at all — the beat is happening anyway.
+    pub pending_check: Mutex<Option<Value>>,
     /// Last 7 days of hourly history, newest last — the rendered form of
     /// history.jsonl, served at /stats for the dashboard's charts.
     pub history: Mutex<Value>,
@@ -125,8 +146,11 @@ impl Shared {
             peers_in: AtomicU64::new(0),
             peers_out: AtomicU64::new(0),
             peers_in_peak: AtomicU64::new(0),
+            v6_inbound_seen: AtomicBool::new(false),
+            v6_inbound_at: AtomicU64::new(0),
             torrents: AtomicU64::new(0),
             listen_port: AtomicU64::new(0),
+            local_port: AtomicU64::new(0),
             seed_up_bps: AtomicU64::new(0),
             reachable: AtomicU8::new(0),
             seed_granted: AtomicBool::new(false),
@@ -138,6 +162,7 @@ impl Shared {
             trends: Mutex::new(Trends::default()),
             update_available: Mutex::new(None),
             natpmp: std::sync::Arc::new(Mutex::new("off".to_string())),
+            pending_check: Mutex::new(None),
             masterlist_version: AtomicU64::new(0),
             history: Mutex::new(json!([])),
         }
@@ -148,6 +173,82 @@ impl Shared {
         self.peers_in.store(incoming, Ordering::Relaxed);
         self.peers_out.store(outgoing, Ordering::Relaxed);
         self.peers_in_peak.fetch_max(incoming, Ordering::Relaxed);
+    }
+
+    /// Record that a global-IPv6 peer dialled in. Monotonic: this can only ever
+    /// turn ON. Persists immediately, because the whole value of the fact is
+    /// that it survives the restart that follows.
+    pub fn note_v6_inbound(&self) {
+        let now = now_secs();
+        let first = !self.v6_inbound_seen.swap(true, Ordering::Relaxed);
+        if !first {
+            // Already known — but REFRESH the date. This is the whole point of
+            // 0.2.5: the flag is not the claim, the date is. Only rewrite the
+            // file when the day has actually changed, so a busy node is not
+            // writing to an SD card every minute.
+            let prev = self.v6_inbound_at.load(Ordering::Relaxed);
+            self.v6_inbound_at.store(now, Ordering::Relaxed);
+            if now / 86_400 != prev / 86_400 {
+                save_v6_proof(now);
+            }
+            return;
+        }
+        self.v6_inbound_at.store(now, Ordering::Relaxed);
+        save_v6_proof(now);
+        println!(
+            "[reach] a peer connected to you over IPv6 — your node is reachable.\n\
+             [reach] Nothing to forward, nothing to change. This is the normal good\n\
+             [reach] result on Starlink, T-Mobile Home Internet and mobile broadband."
+        );
+    }
+
+    /// The honest reachability answer, combining both kinds of evidence.
+    ///
+    /// ACTIVE  — the probe edge dialled us and got through (IPv4 only, in
+    ///           practice: the edge has no outbound IPv6).
+    /// PASSIVE — a real peer dialled us over global IPv6.
+    ///
+    /// Before this, the CLI reported `open || open_v6`, and `open_v6` can never
+    /// be true for anybody. So it collapsed to the IPv4 answer alone, and every
+    /// node behind CGNAT — which is most households on Starlink or mobile
+    /// broadband, exactly the people we are asking to run one — was filed as an
+    /// unreachable "peer" however reachable it actually was.
+    pub fn reachable_verdict(&self, probe: Option<bool>) -> Option<bool> {
+        if self.v6_confirmed_recently() {
+            return Some(true);
+        }
+        probe
+    }
+
+    /// Has a peer dialled in over IPv6 within the confirmation window?
+    ///
+    /// The FACT that it once happened is kept for ever — it is true, and the UI
+    /// still shows the date. What expires is the licence to state it in the
+    /// present tense. See config::reach_confirm_days for why this is a recency
+    /// window and not a rate.
+    pub fn v6_confirmed_recently(&self) -> bool {
+        if !self.v6_inbound_seen.load(Ordering::Relaxed) {
+            return false;
+        }
+        let at = self.v6_inbound_at.load(Ordering::Relaxed);
+        if at == 0 {
+            // Seen, but we never recorded when — an old state file. Treat it as
+            // current rather than silently demoting somebody on an upgrade;
+            // the next scan will stamp a real date on it.
+            return true;
+        }
+        let window = config::reach_confirm_days(&config::load_settings()) * 86_400;
+        now_secs().saturating_sub(at) <= window
+    }
+
+    /// Days since the last inbound IPv6 connection, or None if there never was
+    /// one. For wording like "last confirmed 34 days ago".
+    pub fn v6_age_days(&self) -> Option<u64> {
+        let at = self.v6_inbound_at.load(Ordering::Relaxed);
+        if !self.v6_inbound_seen.load(Ordering::Relaxed) || at == 0 {
+            return None;
+        }
+        Some(now_secs().saturating_sub(at) / 86_400)
     }
 
     /// Record the latest reachability self-test (None = unknown/probe failed).
@@ -244,9 +345,14 @@ impl Shared {
             "peers_in": self.peers_in.load(Ordering::Relaxed),
             "peers_out": self.peers_out.load(Ordering::Relaxed),
             "peers_in_peak": self.peers_in_peak.load(Ordering::Relaxed),
+                "v6_inbound_seen": self.v6_inbound_seen.load(Ordering::Relaxed),
+            "v6_inbound_at": self.v6_inbound_at.load(Ordering::Relaxed),
+            "v6_confirmed": self.v6_confirmed_recently(),
+            "v6_age_days": self.v6_age_days(),
             "masterlist_version": self.masterlist_version.load(Ordering::Relaxed),
             "update_available": self.update_available.lock().unwrap().clone(),
             "natpmp": self.natpmp.lock().unwrap().clone(),
+            "local_port": self.local_port.load(Ordering::Relaxed),
         });
         let system = json!({
             "cpu_pct": (sys.cpu_pct as f64 * 10.0).round() / 10.0,
@@ -438,4 +544,23 @@ pub fn load_history() -> Value {
         .filter(|v| v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0) >= cutoff)
         .collect();
     json!(rows)
+}
+
+/// The IPv6 reachability proof, kept in its own tiny file.
+///
+/// Not in settings.json on purpose: that file is edited by hand, by the desktop
+/// app, and by `config`, and a measurement has no business sharing a file with
+/// preferences. Losing this costs a node its green status until the next peer
+/// arrives, which is a recoverable inconvenience rather than a problem.
+pub fn load_v6_proof() -> Option<u64> {
+    std::fs::read_to_string(config::data_dir().join("v6-inbound"))
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .filter(|ts| *ts > 0)
+}
+
+pub fn save_v6_proof(ts: u64) {
+    let dir = config::data_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let _ = std::fs::write(dir.join("v6-inbound"), ts.to_string());
 }

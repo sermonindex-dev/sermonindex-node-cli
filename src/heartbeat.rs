@@ -85,10 +85,18 @@ pub async fn probe_reachability(client: &reqwest::Client, port: u16) -> Option<b
     // address a BitTorrent peer would actually use for global egress. The v6
     // list travels in the BODY, so a single request sent over IPv4 still gets
     // both answers: `open` for our public IPv4, `open_v6` for the addresses here.
-    let body = match crate::net::global_ipv6() {
+    let mut body = match crate::net::global_ipv6() {
         Some(v6) => json!({ "port": port, "ipv6": [v6.to_string()] }),
         None => json!({ "port": port }),
     };
+    // An explicitly configured public address, for the split-tunnel case: the
+    // torrent traffic goes through a VPN but this request does not, so the edge
+    // would otherwise test the home address, find it closed, and file a
+    // perfectly reachable node as a yellow peer. Harmless when unset, and the
+    // edge is free to ignore it.
+    if let Some(ip) = crate::config::public_ip(&crate::config::load_settings()) {
+        body["public_ip"] = json!(ip);
+    }
 
     // Prefer the IPv4-pinned client so `open` is a real IPv4 measurement. Fall
     // back to the shared client on an IPv6-only host, where forcing IPv4 would
@@ -183,7 +191,7 @@ pub async fn beat(
         Some(b) => Value::Bool(b),
         None => Value::Null,
     };
-    let body = json!({
+    let mut body = json!({
         "node_id": shared.node_id,
         "protocol": "bittorrent",
         "app_version": APP_VERSION,
@@ -224,6 +232,17 @@ pub async fn beat(
             "uptime": shared.started.elapsed().as_secs(),
         }
     });
+    // Ask to be checked when we have a global IPv6 address and nothing has
+    // confirmed us recently. A node that is already confirmed does not need the
+    // favour, and one without IPv6 cannot be helped this way.
+    if public_ipv6.is_some() && !shared.v6_confirmed_recently() {
+        body["wants_check"] = json!(true);
+    }
+    // Report a check we performed for someone else on the previous beat.
+    if let Some(r) = shared.pending_check.lock().unwrap().take() {
+        body["check_result"] = r;
+    }
+
     let resp = client
         .post(format!("{API_BASE}/api/node/heartbeat"))
         .json(&body)

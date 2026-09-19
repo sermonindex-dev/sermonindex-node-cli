@@ -54,6 +54,7 @@ fn session_options(
     enable_dht: bool,
     upload_bps: Option<NonZeroU32>,
     peer_limit: usize,
+    announce_port: Option<u16>,
 ) -> SessionOptions {
     let listen_addr: std::net::SocketAddr = if ipv6 {
         (std::net::Ipv6Addr::UNSPECIFIED, port).into()
@@ -75,6 +76,14 @@ fn session_options(
             listen_addr,
             enable_upnp_port_forwarding: true,
             ipv4_only: !ipv6,
+            // The port we TELL the world to dial, which is not always the port
+            // we bound. librqbit writes this into every tracker announce
+            // (`TrackerComms::start(.., announce_port, ..)`) and every DHT
+            // `announce_peer` — so this one field is the entire answer to "how
+            // does a node behind a VPN tell other nodes where to find it?".
+            // It does not need a gossip layer of our own; BitTorrent has had
+            // this since the beginning. None falls back to the listen port.
+            announce_port,
             ..Default::default()
         }),
         // ── Low-footprint tuning (matters a LOT at 25k+ torrents on a Pi) ──
@@ -125,6 +134,8 @@ pub struct Seeder {
     /// the v6 socket does not accept v4-mapped connections this node is
     /// IPv6-only inbound, which no amount of port forwarding will change.
     ipv6: bool,
+    /// The public port stamped into every announce, when it differs from `port`.
+    announce_port: Option<u16>,
 }
 
 /// Inbound vs outbound peer connections, summed across every live torrent.
@@ -142,6 +153,22 @@ pub struct Directions {
     pub outgoing: u64,
     /// Live torrents that had a peer table to inspect.
     pub torrents_checked: u64,
+    /// PROOF OF IPv6 REACHABILITY: a peer at a global-unicast IPv6 address
+    /// opened a connection TO US.
+    ///
+    /// This is the single most important flag for a home node. Carrier-grade
+    /// NAT — Starlink, T-Mobile Home Internet, most mobile broadband — makes
+    /// inbound IPv4 impossible for ever, and those same carriers hand out real
+    /// routable IPv6. So an ordinary household running a node is very often
+    /// perfectly reachable, over IPv6, and our active probe can NEVER show it:
+    /// the probe runs on a Bunny edge script with no outbound IPv6 at all.
+    ///
+    /// A real peer dialling in is better evidence than any probe anyway. Nobody
+    /// arranged it on our behalf; a stranger on the internet reached this
+    /// machine unaided.
+    pub inbound_ipv6: bool,
+    /// How many distinct global-IPv6 peers dialled in (context, not a verdict).
+    pub inbound_ipv6_peers: u64,
 }
 
 impl Seeder {
@@ -151,11 +178,27 @@ impl Seeder {
     /// than baked in as a constant. The 8 that used to live here was measured
     /// on a 4 GB Pi and then applied to every machine including a 16 GB Mac
     /// mini — see config::peer_limit_per_torrent() for what replaced it.
+    ///
+    /// `announce_port` is the port peers are told to dial. Leave it None when
+    /// the node is reachable at the port it bound; set it when a VPN or an
+    /// upstream NAT has given the node a different public port. It CANNOT be
+    /// changed after the session starts — it is stamped into every announce —
+    /// so it must be known before we get here.
+    ///
+    /// `preferred_port` is the LOCAL socket to try first (config::listen_port).
+    /// The default range stays as the fallback rather than this being a hard
+    /// requirement: refusing to seed at all because something transient held
+    /// the port for a moment is worse than seeding on a different one. The
+    /// caller compares the two and says so when they differ, so an operator
+    /// whose hand-written router rule has stopped matching finds out from the
+    /// log instead of from a reachability test weeks later.
     pub async fn start(
         download_dir: &Path,
         upload_bps: Option<u32>,
         dht: bool,
         peer_limit: usize,
+        announce_port: Option<u16>,
+        preferred_port: Option<u16>,
     ) -> Result<Seeder> {
         std::fs::create_dir_all(download_dir).ok();
         let cap = upload_bps.and_then(NonZeroU32::new);
@@ -168,11 +211,14 @@ impl Seeder {
             [(true, false), (false, false), (false, false)]
         };
         let mut last = String::new();
-        for port in LISTEN_PORT_START..=LISTEN_PORT_END {
+        let candidates = preferred_port.into_iter().chain(
+            (LISTEN_PORT_START..=LISTEN_PORT_END).filter(|p| Some(*p) != preferred_port),
+        );
+        for port in candidates {
             for (ipv6, dht) in combos {
                 match Session::new_with_opts(
                     download_dir.to_path_buf(),
-                    session_options(port, ipv6, dht, cap, peer_limit),
+                    session_options(port, ipv6, dht, cap, peer_limit, announce_port),
                 )
                 .await
                 {
@@ -185,6 +231,7 @@ impl Seeder {
                             spawner: BlockingSpawner::new(BLOCKING_THREADS),
                             port,
                             ipv6,
+                            announce_port,
                         });
                     }
                     Err(e) => {
@@ -199,7 +246,10 @@ impl Seeder {
             }
         }
         Err(anyhow!(
-            "could not start torrent session in {LISTEN_PORT_START}..{LISTEN_PORT_END} (last: {last})"
+            "could not start torrent session on {}{LISTEN_PORT_START}..{LISTEN_PORT_END} (last: {last})",
+            preferred_port
+                .map(|p| format!("{p}, then "))
+                .unwrap_or_default()
         ))
     }
 
@@ -376,9 +426,17 @@ impl Seeder {
         self.session.with_torrents(|iter| iter.count())
     }
 
-    /// The TCP port this session is really listening on.
+    /// The TCP port this session is really listening on, locally.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// The port peers are told to dial — the announce port when one was given,
+    /// else the local one. This is the number that belongs in the heartbeat, in
+    /// the reachability probe, and in anything shown to a person: it is the one
+    /// the outside world actually uses.
+    pub fn public_port(&self) -> u16 {
+        self.announce_port.unwrap_or(self.port)
     }
 
     /// True when the listening socket was bound on `[::]` rather than `0.0.0.0`.
@@ -415,11 +473,23 @@ impl Seeder {
                     serde_json::from_value(serde_json::json!({ "state": "all" }))
                         .unwrap_or_default(),
                 );
-                for (_addr, peer) in snapshot.peers.iter() {
-                    if peer.counters.incoming_connections > 0 {
+                for (addr_str, peer) in snapshot.peers.iter() {
+                    let inbound = peer.counters.incoming_connections > 0;
+                    if inbound {
                         d.incoming += 1;
                     } else if peer.counters.connections > 0 {
                         d.outgoing += 1;
+                    }
+                    // Only an INBOUND connection counts as reachability proof.
+                    // An outbound one to an IPv6 peer shows our egress works
+                    // and nothing whatsoever about whether anyone can reach us.
+                    if inbound {
+                        if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                            if crate::net::is_global_unicast_ipv6_peer(&addr) {
+                                d.inbound_ipv6 = true;
+                                d.inbound_ipv6_peers += 1;
+                            }
+                        }
                     }
                 }
             }

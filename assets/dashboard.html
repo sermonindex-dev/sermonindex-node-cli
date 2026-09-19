@@ -121,7 +121,10 @@ document.getElementById('logo').src=LOGO;
 var moonSVG='<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
 var sunSVG='<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>';
 // node category colours — copied from the node software (NetworkPage.jsx NODE_COLORS, tuned for the navy map)
-var NC={seed:'#4f8fe0',node:'#4caf50',peer:'#f8d355'};
+// Identical to the desktop app's NODE_COLORS (NetworkPage.jsx). The green
+// moved #4caf50 -> #3fbf6a in 0.2.5 purely to lift the colour-blind margin
+// against the yellow (tritan dE 4.9 -> 8.0); it is visually the same green.
+var NC={seed:'#4f8fe0',node:'#3fbf6a',peer:'#f8d355'};
 var $=function(s){return document.querySelector(s)};
 function fb(b){b=Number(b||0);var u=['B','KB','MB','GB','TB'],i=0;while(b>=1024&&i<4){b/=1024;i++}return b.toFixed(b<10&&i?1:0)+' '+u[i]}
 function fbps(b){return fb(b)+'/s'}
@@ -350,7 +353,7 @@ function render(){
              '<div class="card"><div class="lbl">Sermons held</div><div class="big">'+fn(n.held)+'</div><div class="sm">of '+fn(n.catalog||'—')+' in catalog</div></div>'+
              '<div class="card"><div class="lbl">Peers served</div><div class="big" style="color:var(--dirin)">'+fn(n.peers_in_peak!=null?n.peers_in_peak:n.peers)+'</div><div class="sm">came to you · '+fn(n.peers)+' connected now</div></div>'+
              '<div class="card"><div class="lbl">Uploading</div><div class="big" style="color:var(--seedblue)">'+fbps(sy.up_bps)+'</div><div class="sm">to the swarm</div></div>'+
-             '<div class="card"><div class="lbl">Library size</div><div class="big">'+fb(sy.disk_used)+'</div><div class="sm">uptime '+fdur(n.uptime_s)+'</div></div>'+
+             '<div class="card"><div class="lbl">Library size</div><div class="big">'+fb(n.storage_bytes||sy.disk_used)+'</div><div class="sm">uptime '+fdur(n.uptime_s)+'</div></div>'+
            '</div>'+
          '</div>'+
        '</div>'+

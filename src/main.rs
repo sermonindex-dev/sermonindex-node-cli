@@ -15,6 +15,7 @@ mod state;
 mod system;
 mod cfg;
 mod natpmp;
+mod peercheck;
 mod update;
 #[cfg(feature = "seed")]
 mod seed;
@@ -103,6 +104,11 @@ COMMANDS
                  config upload 2000             KB/s, or "off" for unlimited
                  config monthly-cap 500GB       total upload per month, or "off"
                  config schedule 22:00-06:00    only seed in this window ("off")
+                 config public-port 51413       the port the WORLD dials, when a
+                                                VPN or upstream NAT gives you a
+                                                different one ("auto" to clear)
+                 config public-ip 1.2.3.4       only for split tunnels (see docs)
+                 config natpmp off              stop asking the gateway for a port
                  config p2p off                 download and hold; never serve
                  config source archive          prefer archive.org over the CDN
                  config dht on|off              join the DHT
@@ -134,6 +140,24 @@ START OPTIONS
   --no-download          Don't fetch anything new; only seed what's on disk and
                          serve the dashboard (a pure seeder / mirror).
   --no-dashboard         Don't start the local dashboard web server.
+  --public-port <n>      The port peers should be told to dial, when it differs
+                         from the one bound locally — a VPN with port forwarding
+                         being the usual reason. Overrides settings.json for this
+                         run only, so a wrapper that pulls a fresh port from a
+                         VPN's CLI can pass it straight in:
+                           sermonindex-node start --public-port "$(get-vpn-port)"
+                         SI_PUBLIC_PORT does the same via the environment.
+                         Normally unnecessary: NAT-PMP finds it automatically,
+                         including inside a Proton VPN tunnel.
+  --port N               Pin the LOCAL listening port (saved; 1-65535).
+                         Pin one before writing a router rule by hand: a rule
+                         names ONE port, and the default picks the first free
+                         port in 42800-42839, so an unpinned node matches such a
+                         rule only by luck. Below 1024 needs root on Linux/macOS.
+                         If N is taken at startup the node falls back to the
+                         default range and prints a WARNING saying so.
+                         SI_LISTEN_PORT does the same via the environment.
+  --no-port              Clear a pinned port; go back to the automatic range.
   --no-heartbeat         Don't announce to the network map (local / testing use).
 
 CONFIGURATION   (~/.sermonindex/settings.json — shared with the desktop app)
@@ -141,6 +165,8 @@ CONFIGURATION   (~/.sermonindex/settings.json — shared with the desktop app)
   seed_scope             "audio" or "full".
   upload_limit_enabled   true/false — cap the BitTorrent upload rate.
   upload_limit_kbps      Upload cap in KB/s when enabled (0 = unlimited).
+  listen_port            Pinned local listening port (see --port). Unset = pick
+                         the first free port in 42800-42839.
   node_id                Auto-generated on first run ("si-" + 16 hex). Your stable
                          identity on the node map — keep it.
   quiet_hours            Weekly silence windows (see the quiet command), e.g.
@@ -175,6 +201,15 @@ NETWORK / REACHABILITY
   with NO port-forward at all — the global IPv6 address is dialed directly. The
   detected address is printed at startup. If you have only IPv4 behind NAT,
   forward TCP 42800 to this host (or rely on UPnP/NAT-PMP) to show as a green node.
+
+  WRITING THE RULE YOURSELF. When UPnP and NAT-PMP are both unavailable, pin the
+  port first (--port 42800) so the rule keeps matching, then:
+    IPv4   forward TCP <port> to this host.
+    IPv6   there is no NAT and nothing to forward — the router simply blocks
+           unsolicited inbound. Add a PINHOLE allowing inbound TCP to
+           [<your global IPv6>]:<port>. Routers call this "IPv6 Firewall",
+           "Pinhole", "Allow Inbound IPv6" or "IPv6 Simple Security".
+           `sermonindex-node status` prints the address and port to use.
   Seeding holds one open file per torrent, so a full library needs a high open-
   file limit — the installed service sets LimitNOFILE; elsewhere raise ulimit -n.
 
@@ -188,6 +223,7 @@ EXAMPLES
   sermonindex-node start
   sermonindex-node start --scope full --dir /mnt/library
   sermonindex-node start --no-download          # seed-only mirror
+  sermonindex-node start --port 42800           # pin the port for a router rule
   sermonindex-node status
 
 Every node running this appears on the live map and helps keep the archive
@@ -486,21 +522,79 @@ fn run_port() -> Result<()> {
     let reach = n.get("reachable").and_then(|x| x.as_str()).unwrap_or("unknown");
     let nat = n.get("natpmp").and_then(|x| x.as_str()).unwrap_or("off");
 
+    let settings = config::load_settings();
+    let pinned = config::listen_port(&settings);
+
     println!("\nPort and reachability");
     println!("  listening on     TCP {port}");
-    if port != config::LISTEN_PORT_START as u64 {
-        println!("                   (NOT the default {} — forward THIS one)", config::LISTEN_PORT_START);
+    match pinned {
+        // The pin did not take. Say it here too, not just at startup — `status`
+        // is where someone looks when their router rule has stopped working,
+        // and this is the reason.
+        Some(p) if p as u64 != port => {
+            println!("                   PINNED {p} IS NOT IN USE — a router rule naming");
+            println!("                   {p} will not match. Free it and restart, or");
+            println!("                   re-pin with --port {port}.");
+        }
+        Some(p) => println!("                   (pinned with --port {p})"),
+        None if port != config::LISTEN_PORT_START as u64 => {
+            println!("                   (NOT the default {} — forward THIS one, and", config::LISTEN_PORT_START);
+            println!("                   consider --port {port} so it stays this number)");
+        }
+        None => {}
     }
     println!("  NAT-PMP / PCP    {nat}");
     println!("  inbound test     {reach}");
     println!();
+    let v6 = n.get("v6_inbound_seen").and_then(|x| x.as_bool()).unwrap_or(false);
+    if v6 {
+        println!("  IPv6            a peer has connected TO you over IPv6");
+        println!();
+        println!("  You are reachable. Someone out on the internet dialled this machine");
+        println!("  directly — that is stronger evidence than any test we could run, and");
+        println!("  it is the normal good result on Starlink, T-Mobile Home Internet and");
+        println!("  mobile broadband. Nothing to forward. Nothing to change.");
+        println!();
+        return Ok(());
+    }
+    // The exact rule to write. An IPv6 pinhole needs this machine's own global
+    // address, which nobody can be expected to find for themselves — and
+    // without it the instruction "add a pinhole" is not actionable advice.
+    if reach != "reachable" && !v6 {
+        if let Some(addr) = net::global_ipv6() {
+            println!("  To open it by hand, in your router's settings:");
+            println!("    IPv4   forward TCP {port} to this machine");
+            println!("    IPv6   allow inbound TCP to [{addr}]:{port}");
+            println!("           (no forwarding — IPv6 has no NAT. Look for \"IPv6");
+            println!("            Firewall\", \"Pinhole\" or \"Allow Inbound IPv6\".)");
+            if pinned.is_none() {
+                println!("    First: sermonindex-node start --port {port}");
+                println!("           so the rule keeps matching after a restart.");
+            }
+            println!();
+        }
+    }
     match reach {
         "reachable" => println!("  Peers can dial you directly. Nothing to do."),
         "closed" => {
-            println!("  Nothing could connect in. If you can, forward TCP {port} on your");
-            println!("  router to this machine. Many people cannot — Starlink, T-Mobile Home");
-            println!("  Internet and most mobile broadband share one address between homes —");
-            println!("  and a node that only dials out is still genuinely useful.");
+            println!("  Nothing has connected in YET.");
+            println!();
+            println!("  Two things to know before you change anything:");
+            println!();
+            println!("  1. The test above only checks the older kind of address (IPv4). If");
+            println!("     your provider shares one of those between many homes — Starlink,");
+            println!("     T-Mobile Home Internet, most mobile broadband — it will always");
+            println!("     read closed, and there is no setting that fixes it.");
+            println!();
+            println!("  2. Those same providers give every home a real modern address");
+            println!("     (IPv6), and peers reach you on that instead. We cannot test it");
+            println!("     from here, so we watch for it: the moment a peer dials in over");
+            println!("     IPv6 this will say so, and your node turns green on the map.");
+            println!();
+            println!("  If you DO have a normal connection and can reach your router's");
+            println!("  settings, forwarding TCP {port} to this machine makes you reachable");
+            println!("  on both. If you cannot, leave it — a node that only dials out still");
+            println!("  uploads sermons to every peer it reaches, every day.");
         }
         _ => println!("  Not tested yet — the check runs a few minutes after start."),
     }
@@ -608,14 +702,58 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     let no_heartbeat =
         args.iter().any(|a| a == "--no-heartbeat") || std::env::var("SI_NO_HEARTBEAT").is_ok();
     let upload_bps = config::upload_limit_bps(&settings);
+    // --public-port is a RUN-ONLY override and is deliberately not saved. A
+    // wrapper pulling a fresh port from a VPN's CLI on every start should not
+    // be quietly rewriting the user's settings file each time, and a stale
+    // port left behind in settings.json after the wrapper stops would be worse
+    // than none at all — the node would confidently announce a port nothing is
+    // listening on. Set SI_PUBLIC_PORT for the same effect from a systemd unit.
+    if let Some(p) = arg_value(args, "--public-port") {
+        if p.trim().parse::<u16>().map(|n| n > 0).unwrap_or(false) {
+            std::env::set_var("SI_PUBLIC_PORT", p.trim());
+        } else {
+            eprintln!("[public-port] ignoring --public-port {p:?}: not a port number");
+        }
+    }
+    // --port pins the LOCAL listening socket, and unlike --public-port it IS
+    // saved. The two differ on purpose: a public port handed out by a VPN is
+    // different on every start and must not be written down, whereas a listening
+    // port exists precisely so that it is the same tomorrow as it is today —
+    // that is the whole reason a router rule can name it.
+    if let Some(p) = arg_value(args, "--port") {
+        match p.trim().parse::<u16>() {
+            Ok(n) if n > 0 => {
+                settings["listen_port"] = serde_json::json!(n);
+                let _ = config::save_settings(&settings);
+            }
+            _ => eprintln!("[port] ignoring --port {p:?}: want 1-65535"),
+        }
+    }
+    if args.iter().any(|a| a == "--no-port") {
+        // Remove the key rather than storing null, so an unset port reads as
+        // genuinely absent in settings.json instead of as a value every future
+        // reader has to special-case.
+        if let Some(o) = settings.as_object_mut() {
+            o.remove("listen_port");
+        }
+        let _ = config::save_settings(&settings);
+    }
+    let preferred_port = config::listen_port(&settings);
+    // Only the seeding build binds a socket; a --no-default-features build
+    // reads the setting and has nothing to do with it.
+    #[cfg(not(feature = "seed"))]
+    let _ = preferred_port;
 
     println!("SermonIndex node {} — scope={scope}", env!("CARGO_PKG_VERSION"));
     println!("  node_id {node_id}");
     println!("  storage {}", config::downloads_dir(&settings).display());
+    // The port named here is the one someone would put in a router rule, so it
+    // must be the port we are about to try — not the constant. Telling a user
+    // with `--port 10000` to pinhole 42800 is worse than saying nothing.
+    let banner_port = preferred_port.unwrap_or(config::LISTEN_PORT_START);
     match net::global_ipv6() {
         Some(v6) => println!(
-            "  reachable via IPv6 [{v6}]:{} — no port-forward needed (peers can reach this node directly)",
-            config::LISTEN_PORT_START
+            "  reachable via IPv6 [{v6}]:{banner_port} — no port-forward needed (peers can reach this node directly)"
         ),
         // NOTE: this runs once at startup, and on many machines the DHCPv6
         // lease has not arrived yet — so "none" here does NOT mean the host
@@ -625,12 +763,18 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         None => println!(
             "  no global IPv6 yet (re-checked every heartbeat; a DHCPv6 lease often\n  \
              arrives just after boot). Until then peering needs IPv4 UPnP/NAT-PMP or\n  \
-             a forwarded TCP port {}",
-            config::LISTEN_PORT_START
+             a forwarded TCP port {banner_port}"
         ),
     }
 
     let shared = Arc::new(Shared::new(node_id.clone(), scope.clone()));
+    // Restore the IPv6 reachability proof from a previous run. It is a fact
+    // about the past — a stranger on the internet once dialled this machine —
+    // and a restart does not make it untrue.
+    if let Some(ts) = state::load_v6_proof() {
+        shared.v6_inbound_seen.store(true, Ordering::Relaxed);
+        shared.v6_inbound_at.store(ts, Ordering::Relaxed);
+    }
 
     // Dashboard HTTP server (own OS thread).
     if !no_dashboard {
@@ -701,7 +845,12 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     0 => config::LISTEN_PORT_START,
                     p => p as u16,
                 };
-                let reachable = heartbeat::probe_reachability(&cl, port).await;
+                let probe = heartbeat::probe_reachability(&cl, port).await;
+                // Passive proof outranks the probe. The probe can only ever test
+                // IPv4 (the edge has no outbound IPv6), so believing it alone
+                // files every CGNAT household as unreachable — which is most of
+                // the homes we are asking to run a node.
+                let reachable = sh.reachable_verdict(probe);
                 sh.set_reachable(reachable);
                 // Blue ONLY when the node admin has granted this node seed status
                 // (seed_access.enabled). We must keep reporting it each beat or the
@@ -715,6 +864,17 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                 if let Some(body) = heartbeat::beat(&cl, &sh, &geo, reachable, granted).await {
                     if let Some(v) = update::from_heartbeat(&body) {
                         *sh.update_available.lock().unwrap() = Some(v);
+                    }
+                    // Peer-assisted reachability: the server may ask us to dial
+                    // another node, because we can reach places our own probe
+                    // edge cannot (it has no IPv6 at all). One per beat, and
+                    // peercheck::perform refuses anything that is not a public
+                    // address regardless of what the server said.
+                    if let Some((ip, port, token)) = peercheck::request_from(&body) {
+                        if let Some(open) = peercheck::perform(&ip, port).await {
+                            *sh.pending_check.lock().unwrap() =
+                                Some(peercheck::result_field(&token, open));
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(300)).await;
@@ -780,26 +940,114 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         peer_limit,
         config::total_ram_gb()
     );
+
+    // ── Public port ──────────────────────────────────────────────────────────
+    //
+    // This has to be settled BEFORE the session starts. librqbit stamps the
+    // announce port into every tracker announce and every DHT announce_peer at
+    // construction and never lets it change, so "discover it later" is not an
+    // option — a session already telling 25,000 swarms to dial 42800 cannot be
+    // talked out of it.
+    //
+    // Order of preference:
+    //   1. An explicit setting (`config public-port`, or SI_PUBLIC_PORT) — a
+    //      wrapper that pulls a port from a VPN's own CLI hands it over here.
+    //   2. NAT-PMP, asked at startup. On a home router this maps the port we
+    //      are about to bind; inside a Proton VPN tunnel it returns the
+    //      provider's forwarded port, which is exactly the number we need and
+    //      which nobody had to copy by hand.
+    //   3. Nothing — announce the port we bind, which is right for everyone
+    //      with a normal forwarded port.
+    let explicit_public = config::public_port(&settings);
+    let mut announce_port = explicit_public;
+    let mut mapped: Option<natpmp::MappingResult> = None;
+
+    if announce_port.is_none() && config::natpmp_enabled(&settings) {
+        print!("  natpmp  asking the gateway… ");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        mapped = natpmp::map_once(config::LISTEN_PORT_START).await;
+        match &mapped {
+            Some(m) => {
+                println!(
+                    "port {} via {} (granted {}s)",
+                    m.tcp_external_port, m.gateway, m.lifetime_secs
+                );
+                if m.lifetime_secs <= 120 {
+                    // A short lifetime is the signature of a VPN rather than a
+                    // home router, and it is worth naming: it means this node's
+                    // reachability depends on a renewal every few seconds, and
+                    // on the tunnel staying up.
+                    println!(
+                        "          short lifetime — this looks like a VPN tunnel. The mapping\n\
+                         \x20         will be renewed every {}s; if the tunnel drops, so does\n\
+                         \x20         inbound reachability until it returns.",
+                        (m.lifetime_secs / 2).clamp(15, 3600)
+                    );
+                }
+                announce_port = Some(m.tcp_external_port);
+            }
+            None => println!("no gateway answered (normal on most networks)"),
+        }
+    } else if let Some(p) = explicit_public {
+        println!("  public  port {p} (set explicitly — peers will be told to dial this)");
+    }
+
     let seeder = match seed::Seeder::start(
         &config::downloads_dir(&settings),
         upload_bps,
         dht,
         peer_limit,
+        announce_port,
+        preferred_port,
     )
     .await
     {
         Ok(s) => {
             // Publish the port that was ACTUALLY bound so the reachability
             // probe, the heartbeat and /stats all report the same real number.
-            shared.listen_port.store(s.port() as u64, Ordering::Relaxed);
-            // NAT-PMP / PCP, on the port we ACTUALLY bound. librqbit has already
-            // tried UPnP; a great many routers have UPnP off but answer this.
-            // One task, one UDP round-trip an hour — see the note in natpmp.rs
-            // on why this is safe on a 4 GB Pi.
-            {
+            // Report the PUBLIC port — the one the outside world dials — to
+            // the probe, the heartbeat and /stats. On a plain node that is the
+            // port we bound; behind a VPN it is the provider's forwarded port,
+            // and testing the local one would fail for ever while the node was
+            // in fact perfectly reachable.
+            shared.listen_port.store(s.public_port() as u64, Ordering::Relaxed);
+            shared.local_port.store(s.port() as u64, Ordering::Relaxed);
+            if s.public_port() != s.port() {
+                println!(
+                    "  public  listening on {} · peers are told to dial {}",
+                    s.port(),
+                    s.public_port()
+                );
+            }
+            // A pinned port that did not stick is worth shouting about. The
+            // only reason to pin one is that a router rule names it, so silent
+            // drift means that rule now points at nothing — and the node looks
+            // unreachable for a reason nothing else on screen would explain.
+            match preferred_port {
+                Some(p) if p != s.port() => {
+                    eprintln!(
+                        "  WARNING port {p} was not available — listening on {} instead.\n           \
+                         Any router forward or IPv6 pinhole naming {p} will NOT match.\n           \
+                         Free {p} and restart, or re-pin with --port {}.",
+                        s.port(),
+                        s.port()
+                    );
+                }
+                Some(p) => println!("  port    {p} (pinned)"),
+                None => {}
+            }
+            // Keep the mapping alive, holding the SAME external port so the
+            // number already announced to 25,000 swarms stays true. The renewal
+            // interval comes from the lifetime the gateway granted, not the one
+            // we asked for — Proton grants 60 seconds.
+            if config::natpmp_enabled(&settings) {
                 let st = shared.natpmp.clone();
                 *st.lock().unwrap() = "trying".to_string();
-                natpmp::spawn(s.port(), st);
+                let hold = mapped.as_ref().map(|m| m.tcp_external_port).or(explicit_public);
+                natpmp::spawn(s.port(), hold, st);
+            } else {
+                *shared.natpmp.lock().unwrap() = "off".to_string();
             }
             if s.port() != config::LISTEN_PORT_START {
                 println!(
@@ -1007,6 +1255,12 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     // every ~60 s
                     let d = s.directions();
                     sh.set_directions(d.incoming, d.outgoing);
+                    // The only honest IPv6 reachability signal we will ever get
+                    // — our probe edge has no outbound IPv6, so this passive
+                    // observation is the whole answer for a CGNAT household.
+                    if d.inbound_ipv6 {
+                        sh.note_v6_inbound();
+                    }
                 }
                 tick = tick.wrapping_add(1);
                 // librqbit exposes no lifetime "total uploaded" counter we can
