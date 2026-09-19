@@ -10,15 +10,26 @@
      effectively one colour for a red-green colour-blind reader. */
   --dirin:#3987e5; --dirout:#c98500;
  --olive:#707035;--olive2:#908F51;--tan:#D9CDB6;--green:#3d8a41;--red:#e74c3c;
- --seedblue:#2d6cb5;--peer:#f8d355;--header:#707035;--headertext:#F8F8F2}
+ --seedblue:#2d6cb5;--peer:#f8d355;--header:#707035;--headertext:#F8F8F2;
+ --header-top:#7a7943;--brandgold:#EFDA93;
+ /* the app's sidebar tokens, verbatim (styles.css :root) */
+ --navbg-top:#7a7943;--navbg-bottom:#63632c;--navdim:rgba(248,248,242,.80);
+ --navhover:rgba(255,255,255,.11);--navon:rgba(212,175,55,.18);--navgold:#D4AF37;
+ --elev:0 1px 2px rgba(58,52,34,.07),0 2px 6px rgba(58,52,34,.06);
+ --facelit:inset 0 1px 0 rgba(255,255,255,.65)}
 html[data-theme='dark']{--bg:#1a1a1a;--card:#1e1e1e;--tert:#262620;--edge:#3a3a3a;--edge2:#444;
  --ink:#e4e4da;--ink2:#bbb;--muted:#888;--gold:#D4AF37;--goldtext:#d4af37;
  --olive:#908F51;--olive2:#a7a662;--tan:#5A6B50;--green:#4caf50;--red:#e67e22;
- --seedblue:#6ea8fe;--peer:#f8d355;--header:#2c2c14;--headertext:#F8F8F2}
+ --seedblue:#6ea8fe;--peer:#f8d355;--header:#2c2c14;--headertext:#F8F8F2;
+ --header-top:#3a3a1d;--brandgold:#EFDA93;
+ --navbg-top:#282C1E;--navbg-bottom:#1B1E14;--navdim:rgba(248,248,242,.80);
+ --navhover:rgba(255,255,255,.11);--navon:rgba(212,175,55,.26);--navgold:#D4AF37;
+ --elev:0 1px 2px rgba(0,0,0,.4),0 3px 8px rgba(0,0,0,.34);
+ --facelit:inset 0 1px 0 rgba(255,255,255,.055)}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none}
 html{height:100%}
 body{width:100vw;height:100vh;overflow:hidden;background:var(--bg);color:var(--ink);
- font-family:Verdana,Geneva,'DejaVu Sans',sans-serif;font-size:14px;overscroll-behavior:none;touch-action:manipulation;
+ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',Roboto,'Helvetica Neue','Noto Sans','DejaVu Sans',Arial,sans-serif;font-size:14px;overscroll-behavior:none;touch-action:manipulation;
  display:flex;align-items:center;justify-content:center}
 /* The dashboard is authored at a fixed 800x480. In FULL mode it is scaled by JS
    to fill a normal browser window; in COMPACT mode it renders at native 800x480
@@ -26,7 +37,7 @@ body{width:100vw;height:100vh;overflow:hidden;background:var(--bg);color:var(--i
 #stage{width:800px;height:480px;flex:none;position:relative;overflow:hidden;transform-origin:center;background:var(--bg)}
 body.compact{display:block;width:800px;height:480px}
 body.compact #stage{transform:none!important}
-.top{height:46px;display:flex;align-items:center;gap:12px;padding:0 14px;background:var(--header);color:var(--headertext)}
+.top{height:46px;display:flex;align-items:center;gap:12px;padding:0 14px;background:linear-gradient(180deg,var(--header-top) 0%,var(--header) 100%);color:var(--headertext);box-shadow:inset 0 -1px 0 rgba(0,0,0,.22)}
 .logo{height:22px;display:block}
 .sub{color:var(--headertext);opacity:.82;font-size:.64rem;text-transform:uppercase;letter-spacing:.13em;font-weight:700}
 .spacer{flex:1}
@@ -34,21 +45,24 @@ body.compact #stage{transform:none!important}
  border:1px solid rgba(255,255,255,.28);color:var(--headertext);display:flex;align-items:center;gap:6px}
 .pill .dot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.5)}
 .pill.on .dot{background:#7fdc6b;box-shadow:0 0 7px #7fdc6b}
-.clock{font-variant-numeric:tabular-nums;color:var(--headertext);font-weight:800;font-size:.92rem}
-.tbtn{width:34px;height:34px;border-radius:9px;border:1px solid rgba(255,255,255,.28);background:rgba(255,255,255,.08);
- color:var(--headertext);cursor:pointer;display:flex;align-items:center;justify-content:center}
-.wrap{height:372px;padding:12px 14px}
+.clock{font-variant-numeric:tabular-nums;color:var(--brandgold);font-weight:800;font-size:.92rem;letter-spacing:.02em}
+.tbtn{width:34px;height:34px;border-radius:9px;border:1px solid rgba(0,0,0,.18);
+ background:var(--brandgold);color:#3A3417;cursor:pointer;display:flex;align-items:center;justify-content:center;
+ box-shadow:inset 0 1px 0 rgba(255,255,255,.5),0 1px 2px rgba(0,0,0,.22);transition:background .12s ease}
+.tbtn:hover{background:#F6E7B4}
+.tbtn:active{box-shadow:inset 0 2px 3px rgba(0,0,0,.2)}
+.wrap{height:382px;padding:12px 14px}
 .page{display:none;height:100%}.page.on{display:block}
 .row{display:flex;gap:12px;height:100%}
 .col{display:flex;flex-direction:column;gap:12px}
-.card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:12px 14px;position:relative}
+.card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:12px 14px;position:relative;box-shadow:var(--elev),var(--facelit)}
 .card .lbl{font-size:.6rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:700}
 .card .big{font-size:1.65rem;font-weight:800;color:var(--goldtext);font-variant-numeric:tabular-nums;line-height:1.1;margin-top:2px}
 .card .sm{font-size:.7rem;color:var(--muted);margin-top:1px}
 .tiles{display:grid;grid-template-columns:1fr 1fr;gap:12px;flex:1}
 .gaugewrap{display:flex;flex-direction:column;align-items:center;justify-content:center}
 .bar{height:12px;border-radius:6px;background:var(--tert);overflow:hidden;margin-top:8px}
-.bar>i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,var(--olive2),var(--olive))}
+.bar>i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,var(--olive2),var(--olive));box-shadow:var(--facelit)}
 .bar.blue>i{background:linear-gradient(90deg,#2456a0,var(--seedblue))}
 .spark{width:100%;height:100%;display:block}
 .mapcard{flex:1;padding:0;overflow:hidden;display:flex;flex-direction:column;border-color:#12283b;background:#0a141f}
@@ -58,11 +72,26 @@ body.compact #stage{transform:none!important}
 .maplegend span{display:flex;align-items:center;gap:5px}.maplegend i{width:8px;height:8px;border-radius:50%;display:block}
 .mstrip{display:flex;gap:10px;padding:10px 12px 0}
 .mstrip .card{flex:1;padding:8px 12px}
-.nav{height:62px;display:grid;grid-template-columns:1fr 1fr 1fr 1fr;border-top:1px solid var(--edge)}
-.nav button{background:var(--bg);border:none;border-right:1px solid var(--edge);color:var(--ink2);
- font-size:.92rem;font-weight:700;letter-spacing:.02em;font-family:inherit;cursor:pointer}
+.nav{height:52px;display:grid;grid-template-columns:1fr 1fr 1fr 1fr;
+ background:linear-gradient(180deg,var(--navbg-top) 0%,var(--navbg-bottom) 100%);
+ border-top:1px solid rgba(0,0,0,.22)}
+.nav button{background:transparent;border:none;color:var(--navdim);
+ font-size:.85rem;font-weight:500;letter-spacing:0;font-family:inherit;cursor:pointer;
+ display:flex;flex-direction:row;align-items:center;justify-content:center;gap:10px;
+ transition:all .15s ease}
+.nav button svg{width:20px;height:20px;flex:none}
+.nav button:hover{background:var(--navhover);color:var(--headertext)}
 .nav button:last-child{border-right:none}
-.nav button.on{color:var(--headertext);background:var(--olive);box-shadow:inset 0 3px 0 var(--gold)}
+.nav button.on,.nav button.on:hover{color:#fff;background:var(--navon);
+ box-shadow:inset 0 3px 0 var(--navgold),var(--facelit);font-weight:600}
+.nav button.on svg{color:var(--navgold)}
+.dbars{display:flex;height:100%;gap:8px;align-items:stretch}
+.dbar{flex:1;display:flex;flex-direction:column;min-width:0}
+.dbar-plot{flex:1;min-height:0;display:flex;align-items:flex-end;justify-content:center;gap:2px;
+ border-bottom:1px solid var(--edge2)}
+.dbar-plot i{width:9px;flex:none;border-radius:3px 3px 0 0;min-height:0}
+.dbar span{font-size:.58rem;color:var(--muted);text-align:center;margin-top:4px;white-space:nowrap;
+ overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
 .mini{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:2px}
 .nodelist{display:flex;flex-direction:column;gap:6px;overflow:hidden}
 .nrow{display:flex;align-items:center;gap:8px;font-size:.74rem}
@@ -106,11 +135,11 @@ body.compact #stage{transform:none!important}
   <div class="page" id="p_chat"></div>
 </div>
 <div class="nav">
-  <button class="on" data-p="map">Map</button>
-  <button data-p="net">Network</button>
-  <button data-p="node">Stats</button>
-  <button data-p="sys">System</button>
-  <button data-p="chat">Community</button>
+  <button class="on" data-p="map"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15.3 15.3 0 0 1 4 9 15.3 15.3 0 0 1-4 9 15.3 15.3 0 0 1-4-9 15.3 15.3 0 0 1 4-9z"/></svg><span>Map</span></button>
+  <button data-p="net"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2.4"/><circle cx="5" cy="18" r="2.4"/><circle cx="19" cy="18" r="2.4"/><path d="M10.6 6.9 6.4 15.6M13.4 6.9l4.2 8.7M7.4 18h9.2"/></svg><span>Network</span></button>
+  <button data-p="node"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></svg><span>Stats</span></button>
+  <button data-p="sys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg><span>System</span></button>
+  
 </div>
 </div>
 <script>
@@ -125,6 +154,9 @@ var sunSVG='<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="
 // moved #4caf50 -> #3fbf6a in 0.2.5 purely to lift the colour-blind margin
 // against the yellow (tritan dE 4.9 -> 8.0); it is visually the same green.
 var NC={seed:'#4f8fe0',node:'#3fbf6a',peer:'#f8d355'};
+// Shape, not just colour — identical to the app's node map:
+//   seed  filled dot + outer ring   node  filled dot   peer  hollow ring
+var NS={seed:'ringed',node:'filled',peer:'hollow'};
 var $=function(s){return document.querySelector(s)};
 function fb(b){b=Number(b||0);var u=['B','KB','MB','GB','TB'],i=0;while(b>=1024&&i<4){b/=1024;i++}return b.toFixed(b<10&&i?1:0)+' '+u[i]}
 function fbps(b){return fb(b)+'/s'}
@@ -166,28 +198,44 @@ function worldmap(nodes){
   var lines='',me=(nodes||[]).filter(function(n){return n.self})[0];
   if(me&&me.lat!=null)(nodes||[]).forEach(function(n){
     if(n.self||n.lat==null||n.online===false)return;
-    lines+='<line x1="'+px(me.lon).toFixed(1)+'" y1="'+py(me.lat).toFixed(1)+'" x2="'+px(n.lon).toFixed(1)+'" y2="'+py(n.lat).toFixed(1)+'" stroke="rgba(45,108,181,0.28)" stroke-width="1" stroke-dasharray="4 7"/>';
+    lines+='<line x1="'+px(me.lon).toFixed(1)+'" y1="'+py(me.lat).toFixed(1)+'" x2="'+px(n.lon).toFixed(1)+'" y2="'+py(n.lat).toFixed(1)+'" stroke="rgba(212,175,55,0.30)" stroke-width="1" stroke-dasharray="4 7"/>';
   });
-  var marks='';
+  var marks='',glowDefs='',glowId={},glowN=0;
   (nodes||[]).forEach(function(n){
     if(n.lat==null||n.lon==null)return;
     var x=px(n.lon).toFixed(1),y=py(n.lat).toFixed(1),col=catcol(n);
     // Every node — including this one — is just a coloured dot. No label, and no
     // per-frame SMIL animation (it was a constant WebKit repaint on the kiosk).
-    marks+='<circle cx="'+x+'" cy="'+y+'" r="11" fill="'+col+'" opacity="0.16"/>'+
-           '<circle cx="'+x+'" cy="'+y+'" r="5.5" fill="'+col+'"/><circle cx="'+x+'" cy="'+y+'" r="2" fill="rgba(255,245,220,.85)"/>';
+    var shp=(n.online===false?'filled':(NS[n.category]||'filled'));
+    var baseR=n.self?7.5:5.25, gkey=col+(n.self?'s':'n');
+    if(!glowId[gkey]){
+      glowId[gkey]='gl'+(glowN++);
+      glowDefs+='<radialGradient id="'+glowId[gkey]+'" cx="50%" cy="50%" r="50%">'+
+        '<stop offset="0" stop-color="'+col+'" stop-opacity="'+(n.self?'.32':'.18')+'"/>'+
+        '<stop offset="1" stop-color="'+col+'" stop-opacity="0"/></radialGradient>';
+    }
+    marks+='<circle cx="'+x+'" cy="'+y+'" r="'+(baseR*3).toFixed(2)+'" fill="url(#'+glowId[gkey]+')"/>';
+    if(shp==='hollow'){
+      // Peer: an open ring — "still sharing; not a meeting point".
+      marks+='<circle cx="'+x+'" cy="'+y+'" r="'+baseR+'" fill="none" stroke="'+col+'" stroke-width="'+Math.max(1.6,baseR*0.42).toFixed(2)+'"/>';
+    }else{
+      marks+='<circle cx="'+x+'" cy="'+y+'" r="'+baseR+'" fill="'+col+'"/>';
+      // Seed: the filled dot inside its own halo ring.
+      if(shp==='ringed') marks+='<circle cx="'+x+'" cy="'+y+'" r="'+(baseR+2.6)+'" fill="none" stroke="'+col+'" stroke-width="1.2" opacity=".85"/>';
+      marks+='<circle cx="'+x+'" cy="'+y+'" r="2.25" fill="rgba(255,240,200,.9)"/>';
+    }
   });
   var bgid='mbg';
   return '<svg class="mapsvg" viewBox="0 0 '+mw+' '+mh+'" preserveAspectRatio="xMidYMid meet">'+
-    '<defs><radialGradient id="'+bgid+'" cx="50%" cy="50%" r="70%"><stop offset="0" stop-color="#0c1824"/><stop offset="1" stop-color="#060c14"/></radialGradient></defs>'+
+    '<defs><radialGradient id="'+bgid+'" cx="50%" cy="50%" r="70%"><stop offset="0" stop-color="#0c1824"/><stop offset="1" stop-color="#060c14"/></radialGradient>'+glowDefs+'</defs>'+
     '<rect x="0" y="0" width="'+mw+'" height="'+mh+'" fill="url(#'+bgid+')"/>'+grid+
     '<path d="'+WORLD+'" fill="rgba(22,34,48,0.72)" stroke="rgba(50,80,110,0.35)" stroke-width="0.6"/>'+
     lines+marks+'</svg>';
 }
 function legend(){return '<div class="maplegend">'+
-  '<span><i style="background:'+NC.seed+'"></i>Seed</span>'+
-  '<span><i style="background:'+NC.node+'"></i>Online</span>'+
-  '<span><i style="background:'+NC.peer+'"></i>Peer</span></div>';}
+  '<span style="color:'+NC.seed+'"><i class="lg-ringed" style="background:'+NC.seed+';box-shadow:0 0 0 2px '+NC.seed+'55"></i>Seed node</span>'+
+  '<span style="color:'+NC.node+'"><i style="background:'+NC.node+'"></i>Node \u00b7 port open</span>'+
+  '<span style="color:'+NC.peer+'"><i style="background:transparent;border:2px solid '+NC.peer+'"></i>Peer \u00b7 port closed</span></div>';}
 
 // ── dirBars: inbound vs outbound peer connections, one pair of bars per day ──
 //
@@ -205,8 +253,7 @@ function legend(){return '<div class="maplegend">'+
 // reused here; the legend above names both series, so identity never rests on
 // colour alone.
 function dirBars(hist, h){
-  h = h || 72;
-  if(!hist || !hist.length) return '<div class="mini" style="opacity:.55;padding-top:22px;text-align:center">No record yet — this fills in as the node runs.</div>';
+  if(!hist || !hist.length) return '<div class="mini" style="opacity:.55;padding-top:22px;text-align:center">No record yet \u2014 this fills in as the node runs.</div>';
   // history.jsonl is hourly; fold it into calendar days, keeping each day's
   // PEAK. The live figure drops to 0 every time the seeding rotation moves off
   // the torrents those peers were on, so a day when twenty people took sermons
@@ -223,17 +270,23 @@ function dirBars(hist, h){
   if(!order.length) return '<div class="mini" style="opacity:.55;padding-top:22px;text-align:center">No record yet.</div>';
   var max=1;
   for(var j=0;j<order.length;j++){var v=byDay[order[j]];if(v.inb>max)max=v.inb;if(v.out>max)max=v.out;}
-  var W=100, PB=14, plot=h-PB, slot=W/order.length, bw=Math.max(1.4,(slot-4)/2-0.6);
-  var out='<svg viewBox="0 0 '+W+' '+h+'" preserveAspectRatio="none" style="width:100%;height:100%;display:block">';
-  out+='<line x1="0" y1="'+plot+'" x2="'+W+'" y2="'+plot+'" stroke="currentColor" stroke-opacity=".18" stroke-width=".4" vector-effect="non-scaling-stroke"/>';
-  for(var k2=0;k2<order.length;k2++){
-    var row=byDay[order[k2]], x=k2*slot+2;
-    var hi=(row.inb/max)*plot, ho=(row.out/max)*plot;
-    if(hi>0) out+='<rect x="'+x+'" y="'+(plot-hi)+'" width="'+bw+'" height="'+hi+'" rx="1" fill="var(--dirin)"/>';
-    if(ho>0) out+='<rect x="'+(x+bw+1.2)+'" y="'+(plot-ho)+'" width="'+bw+'" height="'+ho+'" rx="1" fill="var(--dirout)"/>';
-    out+='<text x="'+(k2*slot+slot/2)+'" y="'+(h-3)+'" text-anchor="middle" font-size="6" fill="currentColor" fill-opacity=".5">'+row.lbl+'</text>';
+  // HTML, not SVG. This strip is full-width and a fixed 96px tall, so an SVG
+  // has to be told to stretch — and a stretched viewBox scales the day labels
+  // with it, squashing them into an illegible smear. Divs take a percentage
+  // height directly, so the bars fill the card and the text stays text.
+  // Always SEVEN slots: a bar's width then means the same thing on the node's
+  // first day as on its seventh.
+  var out='<div class="dbars">';
+  for(var k2=0;k2<7;k2++){
+    var row = k2<order.length ? byDay[order[k2]] : null;
+    out+='<div class="dbar"><div class="dbar-plot">';
+    if(row){
+      out+='<i style="height:'+(row.inb/max*100).toFixed(1)+'%;background:var(--dirin)"></i>';
+      out+='<i style="height:'+(row.out/max*100).toFixed(1)+'%;background:var(--dirout)"></i>';
+    }
+    out+='</div><span>'+(row?row.lbl:'')+'</span></div>';
   }
-  return out+'</svg>';
+  return out+'</div>';
 }
 
 // Bind a handler for BOTH mouse and touch. A touchscreen kiosk browser does not
@@ -332,12 +385,12 @@ function render(){
     $('#p_net').innerHTML=
      '<div class="col" style="height:100%">'+
        '<div class="row" style="height:auto">'+
-         '<div class="card" style="flex:1"><div class="lbl">Nodes online</div><div class="big" style="color:var(--green)">'+fn(nw.online_count||0)+'</div><div class="sm">'+fn(nw.seeds||0)+' seed nodes</div></div>'+
-         '<div class="card" style="flex:1"><div class="lbl">Network library</div><div class="big">'+fn(nw.total_sermons||0)+'</div><div class="sm">files shared</div></div>'+
-         '<div class="card" style="flex:1"><div class="lbl">Network storage</div><div class="big" style="color:var(--seedblue)">'+fb(nw.storage)+'</div></div>'+
+         '<div class="card" style="flex:1;min-height:0"><div class="lbl">Nodes online</div><div class="big" style="color:var(--green)">'+fn(nw.online_count||0)+'</div><div class="sm">'+fn(nw.seeds||0)+' seed nodes</div></div>'+
+         '<div class="card" style="flex:1;min-height:0"><div class="lbl">Network library</div><div class="big">'+fn(nw.total_sermons||0)+'</div><div class="sm">files shared</div></div>'+
+         '<div class="card" style="flex:1;min-height:0"><div class="lbl">Network storage</div><div class="big" style="color:var(--seedblue)">'+fb(nw.storage)+'</div></div>'+
        '</div>'+
-       '<div class="row" style="flex:1">'+
-         '<div class="card" style="flex:1.4;display:flex;flex-direction:column"><div class="mini">This node · uploading to the network · last 3 min</div><div style="flex:1">'+spark(tr.up_bps,'--seedblue',fbps,120)+'</div></div>'+
+       '<div class="row" style="flex:1;min-height:0">'+
+         '<div class="card" style="flex:1.4;display:flex;flex-direction:column"><div class="mini">This node · uploading to the network · last 3 min</div><div style="flex:1;min-height:0">'+spark(tr.up_bps,'--seedblue',fbps,120)+'</div></div>'+
          '<div class="card" style="flex:1;display:flex;flex-direction:column"><div class="mini">Nodes by library</div><div class="nodelist">'+(list||'<div class="sm">No other nodes yet</div>')+'</div></div>'+
        '</div>'+
      '</div>';
@@ -346,9 +399,9 @@ function render(){
     var cov=n.coverage_pct||0;
     $('#p_node').innerHTML=
      '<div class="col" style="height:100%">'+
-       '<div class="row" style="flex:1">'+
+       '<div class="row" style="flex:1;min-height:0">'+
          '<div class="card gaugewrap" style="width:200px">'+gauge(cov,'coverage',(cov?cov.toFixed(cov<10?1:0):'0')+'%','--goldtext')+'</div>'+
-         '<div class="col" style="flex:1">'+
+         '<div class="col" style="flex:1;min-height:0">'+
            '<div class="tiles">'+
              '<div class="card"><div class="lbl">Sermons held</div><div class="big">'+fn(n.held)+'</div><div class="sm">of '+fn(n.catalog||'—')+' in catalog</div></div>'+
              '<div class="card"><div class="lbl">Peers served</div><div class="big" style="color:var(--dirin)">'+fn(n.peers_in_peak!=null?n.peers_in_peak:n.peers)+'</div><div class="sm">came to you · '+fn(n.peers)+' connected now</div></div>'+
@@ -359,7 +412,7 @@ function render(){
        '</div>'+
        '<div class="card" style="height:96px;display:flex;flex-direction:column">'+
          '<div class="mini">Peer connections · <b style="color:var(--dirin)">\u25a0 came to you</b> &nbsp; <b style="color:var(--dirout)">\u25a0 you reached out</b> &nbsp;·&nbsp; last 7 days</div>'+
-         '<div style="flex:1">'+dirBars(S.history||[])+'</div></div>'+
+         '<div style="flex:1;min-height:0">'+dirBars(S.history||[])+'</div></div>'+
      '</div>';
   }
   if(p==='chat'){
@@ -379,7 +432,7 @@ function render(){
     $('#p_sys').innerHTML=
      '<div class="row"><div class="card gaugewrap" style="width:210px">'+
        gauge(sy.cpu_pct||0,'CPU load',(sy.cpu_pct!=null?Math.round(sy.cpu_pct):'—')+'%','--seedblue')+'</div>'+
-     '<div class="col" style="flex:1">'+
+     '<div class="col" style="flex:1;min-height:0">'+
        '<div class="card"><div class="lbl">Temperature</div><div class="big" style="color:'+((sy.temp_c||0)>70?'var(--red)':'var(--goldtext)')+'">'+(sy.temp_c!=null?Number(sy.temp_c).toFixed(1)+'°C':'—')+'</div></div>'+
        '<div class="card"><div class="lbl">Memory · '+fb(sy.mem_used)+' / '+fb(sy.mem_total)+'</div><div class="bar blue"><i style="width:'+memPct.toFixed(0)+'%"></i></div></div>'+
        '<div class="card"><div class="lbl">Library drive · '+fb(sy.disk_used)+' / '+fb(sy.disk_total)+'</div><div class="bar"><i style="width:'+dPct.toFixed(0)+'%"></i></div></div>'+
@@ -388,7 +441,7 @@ function render(){
   }
 }
 async function tick(){
-  try{var r=await fetch('/stats',{cache:'no-store'});var j=await r.json();if(j&&j.node&&j.system&&j.system.mem_total){S=j;}}catch(e){}
+  try{var r=await fetch('/stats',{cache:'no-store'});var j=await r.json();if(j&&j.node){S=j;}}catch(e){}
   var d=new Date();$('#clock').textContent=(''+d.getHours()).padStart(2,'0')+':'+(''+d.getMinutes()).padStart(2,'0');
   render();
 }

@@ -45,6 +45,7 @@ fn main() -> Result<()> {
         "peers" => run_peers(),
         "history" => run_history(),
         "port" => run_port(),
+        "refresh" | "sweep" => run_refresh(),
         "update" => {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             rt.block_on(run_update())
@@ -122,6 +123,10 @@ COMMANDS
   history      The last 7 days: peers in vs out, uploaded, files held.
   port         What port we bound, whether the internet can reach it, and what
                NAT-PMP/UPnP managed to do about it.
+  refresh      Sweep for new and missing files RIGHT NOW instead of waiting for
+               the hourly pass, and retry anything that failed earlier. Safe to
+               run any time — the missing set is recomputed from what is on
+               disk, so nothing is fetched twice. (also: sweep)
   update       Check whether a newer node has been released. Never installs
                anything on its own — a seed node mid-upload does not restart
                itself because a version number changed.
@@ -224,6 +229,7 @@ EXAMPLES
   sermonindex-node start --scope full --dir /mnt/library
   sermonindex-node start --no-download          # seed-only mirror
   sermonindex-node start --port 42800           # pin the port for a router rule
+  sermonindex-node refresh                      # fetch new files + retry failures now
   sermonindex-node status
 
 Every node running this appears on the live map and helps keep the archive
@@ -513,6 +519,58 @@ fn day_label(secs: u64) -> String {
         Some(dt) => dt.format("%-d %b").to_string(),
         None => "?".to_string(),
     }
+}
+
+/// Path of the "sweep now" sentinel. A file rather than a socket or an HTTP
+/// route on the dashboard: the daemon may be running as another user or under
+/// systemd, the dashboard port is deliberately unauthenticated, and a zero-byte
+/// file in the data dir needs no privileges, no protocol and no new surface.
+fn refresh_flag() -> std::path::PathBuf {
+    config::data_dir().join("refresh-now")
+}
+
+/// Sleep up to `secs`, returning early when someone asks for a sweep.
+async fn wait_or_refresh(secs: u64) {
+    let flag = refresh_flag();
+    let mut left = secs;
+    while left > 0 {
+        let slice = left.min(60);
+        tokio::time::sleep(Duration::from_secs(slice)).await;
+        left -= slice;
+        if flag.exists() {
+            let _ = std::fs::remove_file(&flag);
+            println!("[masterlist] refresh requested — sweeping now");
+            return;
+        }
+    }
+}
+
+/// `sermonindex-node refresh` — sweep for new and missing files right now.
+///
+/// The daemon already does this hourly, and that sweep is also the retry path
+/// for anything that failed earlier (the missing set is recomputed from what is
+/// actually on disk, so a file that did not land is simply missing again). This
+/// is for the times you do not want to wait an hour: a new batch has just been
+/// published, or a download failed while the connection was down and is now
+/// back.
+fn run_refresh() -> Result<()> {
+    let dir = config::data_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let flag = refresh_flag();
+    std::fs::write(&flag, b"")?;
+    match need_running() {
+        Some(_) => {
+            println!("\nSweep requested — the running node will start within a minute.");
+            println!("  It will fetch anything new in your scope and retry whatever failed before.");
+            println!("  Watch it:  journalctl -u sermonindex-node -f");
+        }
+        None => {
+            println!("\nRequest saved. The node is not running right now —");
+            println!("  it will sweep as soon as it next starts.");
+        }
+    }
+    println!();
+    Ok(())
 }
 
 fn run_port() -> Result<()> {
@@ -1498,7 +1556,11 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         sh.masterlist_version.store(known_version, Ordering::Relaxed);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(config::MASTERLIST_REFRESH_SECS)).await;
+                // Sleep in one-minute slices rather than one long hour, so
+                // `sermonindex-node refresh` can cut the wait short. The sweep
+                // is idempotent — it recomputes what is missing from what is on
+                // disk — so running it early costs nothing but a list fetch.
+                wait_or_refresh(config::MASTERLIST_REFRESH_SECS).await;
                 if sh.quiet.load(Ordering::Relaxed) {
                     continue;
                 }
