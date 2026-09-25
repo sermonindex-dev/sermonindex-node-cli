@@ -20,7 +20,7 @@ mod update;
 #[cfg(feature = "seed")]
 mod seed;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +46,12 @@ fn main() -> Result<()> {
         "history" => run_history(),
         "port" => run_port(),
         "refresh" | "sweep" => run_refresh(),
+        "seed" => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_seed(&args))
+        }
         "update" => {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             rt.block_on(run_update())
@@ -96,6 +102,10 @@ COMMANDS
                  quiet add sun,wed 08:00-13:00  several days at once
                  quiet remove 2                 delete window 2 from the list
                  quiet clear                    remove all quiet hours
+  seed         Full-archive (video) access is granted per machine by a person.
+               Audio scope needs no approval and is always available.
+                 seed request --email you@example.com
+                 seed status
   config       View or change any setting — the same controls the desktop app
                has, from the terminal. Writes settings.json atomically, so the
                app and the node can both edit it safely.
@@ -111,7 +121,12 @@ COMMANDS
                  config public-ip 1.2.3.4       only for split tunnels (see docs)
                  config natpmp off              stop asking the gateway for a port
                  config p2p off                 download and hold; never serve
-                 config source archive          prefer archive.org over the CDN
+                 config source auto             auto | cdn | archive — which HTTP
+                                                source to try first. "auto" (the
+                                                default) sends audio to
+                                                archive.org and video to our CDN
+                 config downloads 8             how many files to fetch at once
+                                                (1-16, default 4)
                  config dht on|off              join the DHT
                  config peers 16                connections per torrent
                  config window 4000             torrents live at once
@@ -136,7 +151,9 @@ COMMANDS
   help         Show this help (also: -h, --help).
 
 START OPTIONS
-  --scope <audio|full>   What to hold and seed:
+  --scope <audio|full>   What to hold and seed. "full" requires approval —
+                         run `seed request` first; an unapproved node starts in
+                         audio scope rather than refusing to run.
                            audio   ~400 GB  — every audio sermon (default)
                            full    ~2.4 TB  — audio + video, a complete backup
                          Falls back to settings.json "seed_scope", else audio.
@@ -226,7 +243,8 @@ SERVICE   (Linux, after build-and-install.sh)
 
 EXAMPLES
   sermonindex-node start
-  sermonindex-node start --scope full --dir /mnt/library
+  sermonindex-node start --dir /mnt/library
+  sermonindex-node seed request --email you@example.com   # then --scope full
   sermonindex-node start --no-download          # seed-only mirror
   sermonindex-node start --port 42800           # pin the port for a router rule
   sermonindex-node refresh                      # fetch new files + retry failures now
@@ -747,6 +765,88 @@ async fn run_verify(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `sermonindex-node seed …` — ask for, and check, seed-node access.
+///
+/// ## Why the CLI has a gate at all (0.2.8)
+///
+/// `--scope full` is the whole archive including video: ~2.4 TB, and a
+/// meaningful share of our egress bill. The desktop app has always required a
+/// per-machine approval before it would show anyone the full-archive controls.
+/// The CLI did not — and the public `/node-software/` page printed the
+/// full-scope command verbatim, so anyone who found the page could pull
+/// everything. That was not a decision anybody made; it was the gate simply
+/// never having been carried across.
+///
+/// The backend this talks to is the SAME one the app has used since 0.0.3xx:
+/// `GET /api/seed/access` and `POST /api/seed/request`, landing in the pending
+/// queue on the admin console. Nothing new was invented here, which is the
+/// point — two request paths with two sets of semantics would be a bug waiting
+/// to happen.
+///
+/// Audio scope is NOT gated and never will be. The audio archive is what we
+/// most want mirrored in as many places as possible; gating it would be working
+/// against ourselves.
+async fn run_seed(args: &[String]) -> Result<()> {
+    let mut settings = config::load_settings();
+    let node_id = config::node_id(&mut settings);
+    let client = reqwest::Client::builder()
+        .user_agent(format!("sermonindex-node/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+
+    match sub {
+        "request" => {
+            let email = arg_value(args, "--email").unwrap_or_default();
+            let email = email.trim().to_string();
+            // Not validation for its own sake: without a way to reach the
+            // operator the admin has nothing to approve but an opaque id, and
+            // the request will simply sit there.
+            if email.is_empty() || !email.contains('@') {
+                bail!(
+                    "seed request needs an email the admin can reply to:\n  \
+                     sermonindex-node seed request --email you@example.com"
+                );
+            }
+            println!("[seed] node {node_id}");
+            println!("[seed] requesting full-archive access for this machine…");
+            match heartbeat::request_seed_access(&client, &node_id, &email).await {
+                Some((true, _)) => {
+                    println!("[seed] already approved — this node has full-archive access.");
+                    println!("[seed] start it with:  sermonindex-node start --scope full");
+                }
+                Some((_, _)) => {
+                    println!("[seed] request sent. A person reviews each one.");
+                    println!("[seed] check with:  sermonindex-node seed status");
+                    println!("[seed] once approved, `--scope full` works with no reinstall.");
+                }
+                None => {
+                    bail!(
+                        "could not reach the access service. Check the connection and try again,\n\
+                         or email {} with this node id: {node_id}",
+                        config::SEED_CONTACT_EMAIL
+                    );
+                }
+            }
+        }
+        "status" | "check" => {
+            println!("[seed] node {node_id}");
+            if heartbeat::check_seed_access(&client, &node_id).await {
+                println!("[seed] GRANTED — `--scope full` is available on this machine.");
+            } else {
+                println!("[seed] not granted.");
+                println!(
+                    "[seed] ask for it with:  sermonindex-node seed request --email you@example.com"
+                );
+                println!("[seed] audio scope (~412 GB) needs no approval and works now.");
+            }
+        }
+        other => bail!(
+            "unknown seed command '{other}' — try `seed request --email …` or `seed status`"
+        ),
+    }
+    Ok(())
+}
+
 async fn run_daemon(args: &[String]) -> Result<()> {
     let mut settings = config::load_settings();
     let node_id = config::node_id(&mut settings);
@@ -754,7 +854,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         settings["storage_dir"] = serde_json::json!(dir);
         let _ = config::save_settings(&settings);
     }
-    let scope = arg_value(args, "--scope").unwrap_or_else(|| config::seed_scope(&settings));
+    let requested_scope = arg_value(args, "--scope").unwrap_or_else(|| config::seed_scope(&settings));
     let no_download = args.iter().any(|a| a == "--no-download");
     let no_dashboard = args.iter().any(|a| a == "--no-dashboard");
     let no_heartbeat =
@@ -801,6 +901,54 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     // reads the setting and has nothing to do with it.
     #[cfg(not(feature = "seed"))]
     let _ = preferred_port;
+
+    // ── seed-access gate (0.2.8) ────────────────────────────────────────────
+    //
+    // Full scope means video: ~2.4 TB and a real share of our egress bill. The
+    // desktop app has always required a per-machine approval before showing
+    // anyone the full-archive controls; the CLI did not, and the public
+    // /node-software/ page printed the full-scope command verbatim. This closes
+    // that, using the same backend the app uses — no second mechanism.
+    //
+    // It DOWNGRADES rather than refuses. A node that was running full scope
+    // before this release keeps every file it already holds and carries on
+    // seeding them; it simply stops fetching new video until it is approved.
+    // Refusing to start would take a working mirror offline to enforce a policy
+    // about what it downloads NEXT, which is the wrong trade in every case.
+    //
+    // Audio scope is never gated. The audio archive is the thing we most want
+    // copied into as many hands as possible.
+    let mut scope = requested_scope.clone();
+    let mut full_pending = false;
+    if requested_scope == "full" && !no_heartbeat {
+        let probe = reqwest::Client::builder()
+            .user_agent(format!("sermonindex-node/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .ok();
+        let granted = match &probe {
+            Some(c) => heartbeat::check_seed_access(c, &node_id).await,
+            // Cannot reach the service — do NOT downgrade. An access check that
+            // fails open on a network blip is a nuisance; one that fails closed
+            // silently turns a trusted seed into an audio node the next time
+            // the admin API hiccups, and nobody would know why.
+            None => true,
+        };
+        if !granted {
+            scope = "audio".to_string();
+            full_pending = true;
+            println!(
+                "\n[seed] Full-archive scope needs per-machine approval, and this node\n\
+                 [seed] does not have it yet. Starting in AUDIO scope (~412 GB) instead —\n\
+                 [seed] everything already downloaded stays on disk and keeps seeding.\n\
+                 [seed]\n\
+                 [seed]   sermonindex-node seed request --email you@example.com\n\
+                 [seed]\n\
+                 [seed] node id: {node_id}\n\
+                 [seed] Once approved it switches itself to full scope on the next\n\
+                 [seed] hourly sweep — no restart, no reinstall.\n"
+            );
+        }
+    }
 
     println!("SermonIndex node {} — scope={scope}", env!("CARGO_PKG_VERSION"));
     println!("  node_id {node_id}");
@@ -1331,9 +1479,23 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         });
     }
 
-    // ── download loop (bounded concurrency) ──────────────────────────────────
-    // Fetch several files at once so one slow or briefly-failing file can't
-    // stall the whole line (the single biggest MVP limitation).
+    // ── download loop (work-stealing, bounded concurrency) ───────────────────
+    //
+    // 0.2.7 replaced `futures_util::stream::for_each_concurrent(4, …)` here,
+    // and the reason is worth keeping written down because the old code looked
+    // completely reasonable.
+    //
+    // `for_each_concurrent` pulls from its stream IN ORDER. Four slow files
+    // therefore occupied all four slots and every healthy file behind them
+    // waited — with thousands queued, one bad mirror presented as a total
+    // freeze. Operators reported it as a hang, which it was not: it was strict
+    // ordering meeting a source nobody was timing.
+    //
+    // Workers now pull from a shared queue whenever they are free, so a slow
+    // file costs exactly one slot and nothing queues behind it. Paired with the
+    // watchdog in download.rs (which gives up on a crawling source after ~30 s
+    // and resumes from the next one), a bad mirror now costs seconds instead of
+    // a night.
     if !no_download {
         let storage_root = config::downloads_dir(&settings);
         let missing: Vec<masterlist::Entry> = entries
@@ -1345,31 +1507,77 @@ async fn run_daemon(args: &[String]) -> Result<()> {
             .cloned()
             .collect();
         let total = entries.len();
-        println!("[download] {} files to fetch (4 in parallel)", missing.len());
+        let workers = config::download_workers(&settings);
+        let prefer_archive = config::prefer_archive(&settings, &scope);
+        println!(
+            "[download] {} files to fetch ({workers} in parallel, {} first)",
+            missing.len(),
+            if prefer_archive { "Archive.org" } else { "CDN" }
+        );
 
         let dl_state = std::sync::Arc::new(tokio::sync::Mutex::new(dl_state));
-        use futures_util::stream::StreamExt as _;
-        futures_util::stream::iter(missing)
-            .for_each_concurrent(4, |e| {
-                let client = client.clone();
-                let shared = shared.clone();
-                let dl_state = dl_state.clone();
-                let storage_root = storage_root.clone();
-                #[cfg(feature = "seed")]
-                let torrents_dir = torrents_dir.clone();
-                #[cfg(feature = "seed")]
-                let seeder = seeder.clone();
-                async move {
-                    // Quiet hours: don't start new fetches until the window
-                    // ends (a file already in flight finishes first — it's
-                    // small — then its slot waits here).
+        // The queue every worker steals from. A Mutex<VecDeque> rather than an
+        // mpsc channel because a worker must be able to put a job BACK (the
+        // quiet-hours path below), and because "how many are left" is a useful
+        // thing to be able to ask.
+        let queue = std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::VecDeque::from(missing),
+        ));
+        // Archive.org throttles per client, so cap how many workers may sit on
+        // it at once. A worker that cannot get a permit does not WAIT — it
+        // reorders its own source list to put the CDN first and gets on with
+        // it. Blocking here would reintroduce exactly the stall we just removed.
+        let archive_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            config::archive_slots(&settings),
+        ));
+
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let client = client.clone();
+            let shared = shared.clone();
+            let dl_state = dl_state.clone();
+            let storage_root = storage_root.clone();
+            let queue = queue.clone();
+            let archive_slots = archive_slots.clone();
+            let refresh = refresh_flag();
+            #[cfg(feature = "seed")]
+            let torrents_dir = torrents_dir.clone();
+            #[cfg(feature = "seed")]
+            let seeder = seeder.clone();
+            handles.push(tokio::spawn(async move {
+                loop {
+                    // Stop pulling new work the moment the drive fills.
+                    if shared.disk_full.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // Quiet hours: don't START new fetches inside the window.
+                    // A file already in flight finishes first — it is small.
                     while shared.quiet.load(Ordering::Relaxed) {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                     }
-                    let urls: Vec<String> = e.download_urls().to_vec();
+                    let e = match queue.lock().await.pop_front() {
+                        Some(e) => e,
+                        None => return, // queue drained — this worker is done
+                    };
+                    let mut urls: Vec<String> = e.download_urls_for(prefer_archive);
                     if urls.is_empty() {
-                        return;
+                        continue;
                     }
+                    // Hold an Archive permit only while we actually lead with
+                    // Archive; `try_acquire` so a full house costs no time.
+                    let _permit = if download::is_archive(&urls[0]) {
+                        match archive_slots.clone().try_acquire_owned() {
+                            Ok(p) => Some(p),
+                            Err(_) => {
+                                // Too many workers on Archive already — this
+                                // one takes the CDN copy instead of queueing.
+                                urls.sort_by_key(|u| download::is_archive(u));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let dest = storage_root.join(config::shard_for(&e.name)).join(&e.name);
                     let outcome = download::ensure_file(&client, &urls, &dest, e.size).await;
                     if matches!(outcome, Ok(download::Outcome::NoSpace)) {
@@ -1410,9 +1618,22 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                             let _ = s.seed_file(&dest, &torrents_dir, Some(&e.info_hash), false).await;
                         }
                     }
+                    // `refresh-now` used to be visible only BETWEEN passes, so
+                    // during a long download the command appeared to do
+                    // nothing and operators ran it repeatedly. Checking it here
+                    // costs one stat() per file and makes it responsive: the
+                    // flag is LEFT in place for the sweep loop to consume, we
+                    // only stop early so that sweep can start.
+                    if refresh.exists() {
+                        println!("[download] refresh requested — ending this pass early");
+                        return;
+                    }
                 }
-            })
-            .await;
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
 
         let ds = dl_state.lock().await;
         state::save_download_state(&ds);
@@ -1547,7 +1768,14 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         let cl = client.clone();
         let sh = shared.clone();
         let settings_r = settings.clone();
-        let scope_r = scope.clone();
+        let mut scope_r = scope.clone();
+        // Set when the operator asked for full scope and did not have access at
+        // startup. The sweep re-checks once an hour, so an approval granted
+        // while the node is running takes effect on its own — the operator does
+        // not have to be told to restart, and more to the point does not have
+        // to be WATCHING to know it happened.
+        let mut awaiting_seed_grant = full_pending;
+        let node_id_r = node_id.clone();
         #[cfg(feature = "seed")]
         let torrents_dir_r = torrents_dir.clone();
         #[cfg(feature = "seed")]
@@ -1563,6 +1791,17 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                 wait_or_refresh(config::MASTERLIST_REFRESH_SECS).await;
                 if sh.quiet.load(Ordering::Relaxed) {
                     continue;
+                }
+                // Was this node approved for full scope while it was running?
+                // One cheap GET an hour, and only while a request is actually
+                // outstanding — a node that never asked never calls this.
+                if awaiting_seed_grant && heartbeat::check_seed_access(&cl, &node_id_r).await {
+                    awaiting_seed_grant = false;
+                    scope_r = "full".to_string();
+                    println!(
+                        "[seed] approved — switching to FULL scope. Video files will start\n\
+                         [seed] arriving on this sweep. Nothing already held is affected."
+                    );
                 }
                 // A full disk clears itself only by someone acting. Re-check
                 // each hour rather than latching forever: they may well have
@@ -1619,11 +1858,20 @@ async fn run_daemon(args: &[String]) -> Result<()> {
 
                 let mut ds = state::load_download_state();
                 let mut got = 0u64;
+                // Ordering here follows the same rule as the opening pass —
+                // `config source`, or scope when that is `auto`. This loop is
+                // deliberately SERIAL: it runs hourly on top of a node that is
+                // already seeding, and a catch-up sweep is not worth competing
+                // with the upload the node exists to do. The watchdog in
+                // download.rs is what keeps it honest — before 0.2.7 a single
+                // crawling source here could eat the entire hour between
+                // sweeps and the node would fall further behind every pass.
+                let prefer_archive_r = config::prefer_archive(&settings_r, &scope_r);
                 for e in missing {
                     if sh.quiet.load(Ordering::Relaxed) {
                         break; // resume next hour; the window matters more
                     }
-                    let urls: Vec<String> = e.download_urls().to_vec();
+                    let urls: Vec<String> = e.download_urls_for(prefer_archive_r);
                     if urls.is_empty() {
                         continue;
                     }

@@ -10,6 +10,11 @@ pub const LISTEN_PORT_START: u16 = 42800;
 pub const LISTEN_PORT_END: u16 = 42839; // inclusive, matches the app
 pub const DASHBOARD_PORT: u16 = 8137;
 pub const API_BASE: &str = "https://app.sermonindex.net";
+
+/// Where a seed-access request goes when the API is unreachable. Kept identical
+/// to `SEED_CONTACT_EMAIL` in the desktop app's SeedNodePage.jsx — an operator
+/// who cannot reach the service must still have somewhere to write.
+pub const SEED_CONTACT_EMAIL: &str = "sermonindex@gmail.com";
 /// Reachability probe edge (server/network-edge-script.js) — TCP-dials this node
 /// back over IPv4 and IPv6 so it can self-report `reachable`, exactly like the
 /// desktop app's `probeReachability()`.
@@ -449,16 +454,73 @@ pub fn p2p_enabled(settings: &Value) -> bool {
     settings.get("p2p_enabled").and_then(|v| v.as_bool()).unwrap_or(true)
 }
 
-/// Where HTTP fallbacks are fetched from: "cdn" (default) or "archive".
+/// Where HTTP fallbacks are fetched from: "auto" (default), "cdn" or "archive".
 ///
-/// The master list carries both for nearly every file, Archive first. This only
-/// changes which one the node PREFERS; the other stays as the fallback, so a
-/// wrong answer here costs a little speed and never availability.
+/// The master list carries both for nearly every file. This only changes which
+/// one the node PREFERS; the other stays as the fallback, so a wrong answer
+/// here costs a little speed and never availability.
+///
+/// **This function was dead until 0.2.7.** It was defined, documented, printed
+/// by `config`, and listed in `--help` — and nothing in the codebase ever
+/// called it, so `config source archive` silently did nothing for every
+/// operator who set it. If you are reading this because a setting appears to
+/// have no effect, check that something actually reads it before believing the
+/// doc comment.
 pub fn content_mode(settings: &Value) -> String {
     match settings.get("content_mode").and_then(|v| v.as_str()) {
         Some("archive") => "archive".to_string(),
-        _ => "cdn".to_string(),
+        Some("cdn") => "cdn".to_string(),
+        _ => "auto".to_string(),
     }
+}
+
+/// Should this node try Archive.org before our CDN?
+///
+/// `archive` and `cdn` are explicit operator choices and are obeyed as written.
+/// `auto` — the default — decides by SCOPE, because the two scopes have
+/// opposite economics:
+///
+///   * **audio** is the common case: ~412 GB, and every byte of it served off
+///     our CDN is a byte we pay Bunny for. Archive.org is a donated public good
+///     that is happy to serve it, so audio goes to Archive first and falls back
+///     to the CDN when Archive is slow — which, since 0.2.7, it actually does.
+///
+///   * **full** means video: ~2.4 TB, held by a handful of trusted seed nodes we
+///     WANT complete as fast as possible, and video is exactly where Archive's
+///     throttling bites hardest. Those nodes go to the CDN first.
+///
+/// The fallback is symmetrical either way, so this is a speed and bandwidth
+/// decision, never an availability one.
+pub fn prefer_archive(settings: &Value, scope: &str) -> bool {
+    match content_mode(settings).as_str() {
+        "archive" => true,
+        "cdn" => false,
+        _ => scope != "full",
+    }
+}
+
+/// How many files to fetch at once. 1–16, default 4.
+///
+/// Hard-coded at 4 until 0.2.7. Four is right for a home connection and absurd
+/// for a node on a data-centre link, which is where our most complete mirrors
+/// live — one operator running three machines in two data centres had no way to
+/// use any of that capacity.
+pub fn download_workers(settings: &Value) -> usize {
+    settings
+        .get("download_workers")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 16) as usize)
+        .unwrap_or(4)
+}
+
+/// The most download slots that may sit on Archive.org at the same moment.
+///
+/// Archive.org throttles per client. Before 0.2.7 a full pool of workers could
+/// all queue behind the same throttle and the node looked frozen; capping it
+/// means the remaining workers keep pulling from the CDN no matter how bad an
+/// afternoon Archive is having. Scales with the pool but never exceeds 3.
+pub fn archive_slots(settings: &Value) -> usize {
+    (download_workers(settings) / 2).clamp(1, 3)
 }
 
 /// The port the outside world can reach this node on, when it differs from the

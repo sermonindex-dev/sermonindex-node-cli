@@ -36,14 +36,31 @@ impl Entry {
             .map(|(s, _)| s)
             .unwrap_or(&self.name)
     }
-    /// Every HTTP source for this file, in the master list's own order:
-    /// Archive.org first wherever a mirror exists, our CDN behind it. The
-    /// caller is expected to walk the list, not just take the head — a mirror
-    /// that is first is not a mirror that is always up, and Archive throttles.
-    pub fn download_urls(&self) -> &[String] {
-        &self.webseeds
+    /// Every HTTP source for this file, ordered by preference.
+    ///
+    /// The master list's own order is Archive.org first wherever a mirror
+    /// exists, our CDN behind it. The caller is expected to walk the list, not
+    /// just take the head — a mirror that is first is not a mirror that is
+    /// always up, and Archive throttles.
+    ///
+    /// `prefer_archive` comes from `config::prefer_archive()`, which reads the
+    /// operator's `config source` setting and, when that is `auto`, decides by
+    /// scope. The sort is STABLE, so within each group the master list's own
+    /// order is preserved — we are only choosing which group leads, never
+    /// reshuffling mirrors against each other.
+    ///
+    /// Nothing is ever removed: a preference that turns out to be wrong costs
+    /// the watchdog's 30 seconds and then the other source takes over, which is
+    /// the whole point of having two.
+    pub fn download_urls_for(&self, prefer_archive: bool) -> Vec<String> {
+        let mut urls = self.webseeds.clone();
+        urls.sort_by_key(|u| {
+            let archive = crate::download::is_archive(u);
+            // false sorts before true, so the preferred group must key to false.
+            if prefer_archive { !archive } else { archive }
+        });
+        urls
     }
-
 }
 
 #[derive(Debug, Clone, Deserialize)]

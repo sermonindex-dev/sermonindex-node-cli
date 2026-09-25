@@ -22,7 +22,7 @@
 //! someone believe a live node just changed scope.
 
 use anyhow::{bail, Result};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::config;
 
@@ -131,9 +131,23 @@ pub fn run(args: &[String]) -> Result<()> {
         "p2p" => s["p2p_enabled"] = json!(on_off(val)?),
         "dht" => s["dht_enabled"] = json!(on_off(val)?),
         "source" => match val {
-            "cdn" | "archive" => s["content_mode"] = json!(val),
-            _ => bail!("source must be 'cdn' or 'archive'"),
+            // "auto" is the default and means: decide by scope. Audio goes to
+            // Archive.org first (it is donated bandwidth and our CDN bill is
+            // real); full/video goes to the CDN first (Archive throttles video
+            // hardest and seed nodes are the ones we want complete). Either
+            // way the other source stays as the fallback — see
+            // config::prefer_archive.
+            "auto" | "cdn" | "archive" => s["content_mode"] = json!(val),
+            _ => bail!("source must be 'auto', 'cdn' or 'archive'"),
         },
+        // How many files to fetch at once. Was hard-coded at 4 before 0.2.7.
+        "downloads" => {
+            let n: u64 = val.parse().map_err(|_| anyhow::anyhow!("not a number: {val}"))?;
+            if !(1..=16).contains(&n) {
+                bail!("downloads must be between 1 and 16");
+            }
+            s["download_workers"] = json!(n);
+        }
         "peers" => {
             let n: u64 = val.parse().map_err(|_| anyhow::anyhow!("not a number: {val}"))?;
             if !(2..=200).contains(&n) {
@@ -273,7 +287,23 @@ fn show() -> Result<()> {
     println!("\n  Content");
     println!("    scope        {}", config::seed_scope(&s));
     println!("    dir          {}", config::downloads_dir(&s).display());
-    println!("    source       {}", config::content_mode(&s));
+    println!(
+        "    source       {}{}",
+        config::content_mode(&s),
+        match config::content_mode(&s).as_str() {
+            "auto" => format!(
+                "   (this scope fetches {} first)",
+                if config::prefer_archive(&s, &config::seed_scope(&s)) { "Archive.org" } else { "our CDN" }
+            ),
+            _ => String::new(),
+        }
+    );
+    println!(
+        "    downloads    {} files at once (max {} of them on Archive.org){}",
+        config::download_workers(&s),
+        config::archive_slots(&s),
+        auto(s.get("download_workers").is_some())
+    );
 
     println!("\n  Tuning   (this machine has {ram:.1} GB RAM)");
     println!(

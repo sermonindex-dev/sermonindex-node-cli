@@ -33,6 +33,39 @@ pub async fn check_seed_access(client: &reqwest::Client, node_id: &str) -> bool 
         && data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// Ask the admin to grant THIS node seed access. Mirrors the desktop app's
+/// `requestSeedAccess()`: POST /api/seed/request { node_id, email } → the row
+/// appears in the pending queue on /admin/seed-nodes.
+///
+/// Returns `(enabled, requested)`. `enabled` can be true immediately if the
+/// admin had already approved this node id before the request was sent — that
+/// is not an error, it is the happy path for someone re-installing on a machine
+/// that was already trusted.
+pub async fn request_seed_access(
+    client: &reqwest::Client,
+    node_id: &str,
+    email: &str,
+) -> Option<(bool, bool)> {
+    let resp = client
+        .post(format!("{API_BASE}/api/seed/request"))
+        .json(&json!({ "node_id": node_id, "email": email }))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: Value = resp.json().await.ok()?;
+    if !data.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    Some((
+        data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+        data.get("requested").and_then(|v| v.as_bool()).unwrap_or(true),
+    ))
+}
+
 /// Ask the probe edge to TCP-connect back to us over IPv4 and (if we have one)
 /// IPv6, and report whether either succeeded. This is the exact mechanism the
 /// desktop app uses: reachable = `open || open_v6`. Returns:
