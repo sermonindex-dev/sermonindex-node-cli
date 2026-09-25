@@ -1031,12 +1031,49 @@ impl Session {
                         }
                     }
                 },
-                Some(Ok((live, checked))) = futs.next(), if !futs.is_empty() => {
-                    let (addr, kind) = (checked.addr, checked.kind);
-                    if let Err(e) = live.add_incoming_peer(checked) {
-                        warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
+                // PATCHED (SermonIndex 0.2.9). This arm used to be
+                //   Some(Ok((live, checked))) = futs.next(), if !futs.is_empty()
+                // and that pattern is what crashed the listener.
+                //
+                // In `tokio::select!`, a branch whose PATTERN fails to match is
+                // disabled for the rest of that call. `Some(Ok(..))` matches only
+                // a SUCCESSFUL handshake check — so the moment `futs.next()`
+                // yielded `Some(Err(..))` (a check that timed out or failed),
+                // this branch switched itself off. If at that same moment `futs`
+                // was full, the `accept()` branch above was off too, by its own
+                // guard. Two disabled branches and no `else` arm is a panic:
+                //
+                //   all branches are disabled and there is no else branch
+                //
+                // The task dies, the process lives on, and the node silently
+                // stops accepting peers — it looks online and serves nobody.
+                //
+                // Both halves of the condition get likelier on a small machine:
+                // failed checks come from `live_wait_initializing(5s)` timing out
+                // under memory pressure, and a full `futs` comes from holding
+                // many torrents. A 2-core VM throttled at a cgroup MemoryHigh hits
+                // both constantly; a 32-thread box hits neither.
+                //
+                // Matching `Some(res)` consumes the error case instead of
+                // refusing it, so the branch can never disable itself. The `else`
+                // is belt-and-braces: if some future change disables both arms,
+                // this yields and loops rather than killing the listener.
+                Some(res) = futs.next(), if !futs.is_empty() => {
+                    match res {
+                        Ok((live, checked)) => {
+                            let (addr, kind) = (checked.addr, checked.kind);
+                            if let Err(e) = live.add_incoming_peer(checked) {
+                                warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
+                            }
+                        }
+                        Err(e) => {
+                            debug!("incoming connection check failed: {e:#}");
+                        }
                     }
                 },
+                else => {
+                    tokio::task::yield_now().await;
+                }
             }
         }
     }

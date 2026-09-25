@@ -1071,6 +1071,29 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     if let Some(v) = update::from_heartbeat(&body) {
                         *sh.update_available.lock().unwrap() = Some(v);
                     }
+                    // Network-wide settings from the console. Both of these were
+                    // delivered on every beat and read by nothing until 0.3.0.
+                    let (mode, mlv) = heartbeat::remote_config(&body);
+                    if let Some(m) = mode {
+                        let mut cur = sh.source_mode.lock().unwrap();
+                        if *cur != m {
+                            println!("[config] content source is now '{m}' (set on the console)");
+                            *cur = m;
+                        }
+                    }
+                    if let Some(v) = mlv {
+                        let mut cur = sh.remote_ml_version.lock().unwrap();
+                        // Empty means "first beat of this run" — adopt the value
+                        // without sweeping, or every restart would trigger one.
+                        if cur.is_empty() {
+                            *cur = v;
+                        } else if *cur != v {
+                            *cur = v;
+                            drop(cur);
+                            println!("[masterlist] the console asked every node to refresh");
+                            let _ = std::fs::write(refresh_flag(), b"");
+                        }
+                    }
                     // Peer-assisted reachability: the server may ask us to dial
                     // another node, because we can reach places our own probe
                     // edge cannot (it has no IPv6 at all). One per beat, and
@@ -1579,6 +1602,79 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                         None
                     };
                     let dest = storage_root.join(config::shard_for(&e.name)).join(&e.name);
+
+                    // ── the swarm, first ─────────────────────────────────────
+                    // Before 0.3.0 every node acquired its library over HTTP and
+                    // used BitTorrent only to serve. Every node a seeder, no node
+                    // ever a leecher — so there was no demand in the swarm and
+                    // fleet-wide upload across 52 nodes was exactly zero. The
+                    // network had a supply side and nothing else.
+                    //
+                    // This is the consumer side. It is OFF unless the console
+                    // says otherwise, because until enough nodes are complete the
+                    // swarm is the slower answer, and it gives up fast when no
+                    // peer has the file — the HTTP path behind it always works,
+                    // so a missed swarm fetch costs seconds, never a stalled slot.
+                    //
+                    // Where it pays: a node holding 96% of the archive and a node
+                    // at 60% are usually in the same region, often the same
+                    // operator's rack, and the files the second one still needs
+                    // are exactly the Archive.org-only ones that trickle. Those
+                    // become a transfer between two machines instead of a queue
+                    // behind a throttle.
+                    #[cfg(feature = "seed")]
+                    let mut got_from_swarm = false;
+                    #[cfg(feature = "seed")]
+                    if !e.magnet.is_empty() {
+                        let mode = shared.source_mode.lock().unwrap().clone();
+                        if mode == "p2p" || mode == "hybrid" {
+                            if let Some(sd) = &seeder {
+                                if let Some(parent) = dest.parent() {
+                                    match sd
+                                        .fetch_file(
+                                            &e.magnet,
+                                            parent,
+                                            e.size,
+                                            Duration::from_secs(25),
+                                            Duration::from_secs(45),
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            // The swarm verified every piece, but
+                                            // the SIGNED master list is the
+                                            // authority on what the file should
+                                            // be. Trusting the swarm on size
+                                            // would let a bad torrent define
+                                            // correctness.
+                                            got_from_swarm = std::fs::metadata(&dest)
+                                                .map(|m| m.len() == e.size)
+                                                .unwrap_or(false);
+                                        }
+                                        Ok(false) => {}
+                                        Err(err) => {
+                                            eprintln!("[p2p] {}: {err:#}", e.name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // `p2p` means the swarm ONLY — an operator who asked for that
+                    // did not ask for a silent fall back to the CDN. `hybrid`
+                    // does fall back, which is what makes it the safe default to
+                    // recommend.
+                    #[cfg(feature = "seed")]
+                    if !got_from_swarm && shared.source_mode.lock().unwrap().as_str() == "p2p" {
+                        continue;
+                    }
+                    #[cfg(feature = "seed")]
+                    let outcome = if got_from_swarm {
+                        Ok(download::Outcome::Downloaded)
+                    } else {
+                        download::ensure_file(&client, &urls, &dest, e.size).await
+                    };
+                    #[cfg(not(feature = "seed"))]
                     let outcome = download::ensure_file(&client, &urls, &dest, e.size).await;
                     if matches!(outcome, Ok(download::Outcome::NoSpace)) {
                         // Say it ONCE, loudly, and stop asking for more. The

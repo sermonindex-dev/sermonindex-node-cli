@@ -83,6 +83,20 @@ pub struct Shared {
     /// headless seed box that restarts itself mid-serve is worse than one that
     /// is a version behind, so nothing here ever installs anything.
     pub update_available: Mutex<Option<String>>,
+    /// The network-wide `source_mode` the admin console publishes, delivered on
+    /// every heartbeat: "cdn", "p2p" or "hybrid".
+    ///
+    /// Until 0.3.0 the CLI read NOTHING out of the heartbeat response except the
+    /// version hint and the peer-check request, so this setting — which has been
+    /// in the console, documented, and delivered on every beat since the
+    /// beginning — did nothing at all. An operator flipping it to Hybrid changed
+    /// no behaviour on any node. That is now the one place the swarm gets
+    /// switched on, so it had better be read.
+    pub source_mode: Mutex<String>,
+    /// The `master_list_version` the console publishes. "Force all nodes to
+    /// refresh" bumps it; a node that sees it change asks for a sweep. Also dead
+    /// before 0.3.0, for the same reason.
+    pub remote_ml_version: Mutex<String>,
     /// Master-list version currently loaded, so the refresh loop and the
     /// dashboard agree on what the node actually knows about.
     pub masterlist_version: AtomicU64,
@@ -161,6 +175,12 @@ impl Shared {
             stats_json: Mutex::new("{}".to_string()),
             trends: Mutex::new(Trends::default()),
             update_available: Mutex::new(None),
+            // "hybrid" is NOT the default. A node must be told to use the swarm,
+            // because until enough nodes are complete the swarm is the slower
+            // answer and a silent default would degrade every operator's
+            // experience to prove a point about architecture.
+            source_mode: Mutex::new("cdn".to_string()),
+            remote_ml_version: Mutex::new(String::new()),
             natpmp: std::sync::Arc::new(Mutex::new("off".to_string())),
             pending_check: Mutex::new(None),
             masterlist_version: AtomicU64::new(0),

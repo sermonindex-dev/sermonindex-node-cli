@@ -299,7 +299,7 @@ fn show() -> Result<()> {
         }
     );
     println!(
-        "    downloads    {} files at once (max {} of them on Archive.org){}",
+        "    downloads    {} files at once (Archive.org PREFERRED for at most {}){}",
         config::download_workers(&s),
         config::archive_slots(&s),
         auto(s.get("download_workers").is_some())

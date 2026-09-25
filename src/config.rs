@@ -513,12 +513,23 @@ pub fn download_workers(settings: &Value) -> usize {
         .unwrap_or(4)
 }
 
-/// The most download slots that may sit on Archive.org at the same moment.
+/// How many download slots may PREFER Archive.org at the same moment.
 ///
 /// Archive.org throttles per client. Before 0.2.7 a full pool of workers could
 /// all queue behind the same throttle and the node looked frozen; capping it
 /// means the remaining workers keep pulling from the CDN no matter how bad an
 /// afternoon Archive is having. Scales with the pool but never exceeds 3.
+///
+/// **It is a preference, not a ceiling** — a point 0.2.8 stated too strongly and
+/// an operator caught within the hour. A worker that cannot get a permit does
+/// not wait; it reorders its own source list to put the CDN first. For a file
+/// that HAS no CDN mirror there is nothing to reorder to, so it goes to Archive
+/// without a permit and all eight slots can legitimately end up there.
+///
+/// That is the right behaviour — an idle slot helps nobody, and the alternative
+/// is a node that stops making progress on precisely the files only Archive
+/// has. A hard cap would have to block, and blocking is the stall this whole
+/// release exists to remove.
 pub fn archive_slots(settings: &Value) -> usize {
     (download_workers(settings) / 2).clamp(1, 3)
 }

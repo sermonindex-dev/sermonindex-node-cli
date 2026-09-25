@@ -253,6 +253,120 @@ impl Seeder {
         ))
     }
 
+    /// Try to FETCH a file from the swarm — the other half of the network.
+    ///
+    /// ## Why this did not exist until 0.3.0
+    ///
+    /// Every node acquired its library over HTTP, from Archive.org and the CDN,
+    /// and used BitTorrent only to serve. So every node was a seeder and no node
+    /// was ever a leecher: there was nothing in the swarm asking for anything,
+    /// and fleet-wide upload sat at exactly zero across 52 nodes. The swarm was
+    /// real — ports open, torrents announced, peers reachable — and completely
+    /// unused, because we had built only the supply side of it.
+    ///
+    /// An operator running three nodes found it by asking the obvious question:
+    /// his nodes had served 0 bytes and he wanted to know whether node-to-node
+    /// transfer was part of the design yet. It was not.
+    ///
+    /// ## What this does
+    ///
+    /// Adds the magnet live, waits for the swarm to produce the file, and gives
+    /// up quickly if it cannot. "Quickly" is the whole design: a file no peer
+    /// holds must cost a few seconds, not a stalled slot, because the HTTP path
+    /// behind it always works. Two limits, both deliberate:
+    ///
+    ///   * `first_byte` — if no peer has sent anything by then, nobody has this
+    ///     file. Give up and let HTTP have it.
+    ///   * `stall` — progress started and then stopped. Same verdict as the HTTP
+    ///     watchdog in download.rs, for the same reason.
+    ///
+    /// On success the file is already verified by BitTorrent's own piece hashes
+    /// and already live in the session, so it begins seeding immediately — the
+    /// node that received it becomes a source for the next one without a second
+    /// pass. The caller still checks the size against the signed master list,
+    /// because the swarm is not the authority on what a file should be.
+    pub async fn fetch_file(
+        &self,
+        magnet: &str,
+        dest_dir: &Path,
+        expected_size: u64,
+        first_byte: std::time::Duration,
+        stall: std::time::Duration,
+    ) -> Result<bool> {
+        if magnet.trim().is_empty() {
+            return Ok(false);
+        }
+        std::fs::create_dir_all(dest_dir).ok();
+
+        let handle = self
+            .session
+            .add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dest_dir.to_string_lossy().to_string()),
+                    overwrite: true,
+                    paused: false,
+                    trackers: Some(trackers()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| anyhow!("add_torrent (fetch): {e:#}"))?;
+
+        let handle = match handle.into_handle() {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+
+        let started = std::time::Instant::now();
+        let mut last_progress = std::time::Instant::now();
+        let mut best: u64 = 0;
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // One stats() call, not two: `finished` and `progress_bytes` must
+            // describe the same instant or a file that completes between the two
+            // reads looks stalled.
+            let st = handle.stats();
+            let done = st.finished;
+            let got = st.progress_bytes;
+
+            if got > best {
+                best = got;
+                last_progress = std::time::Instant::now();
+            }
+
+            if done {
+                // BitTorrent verified every piece to get here. The size check is
+                // the caller's, against the SIGNED list — the swarm is not the
+                // authority on what a file should be.
+                return Ok(true);
+            }
+            // Nobody has it. This is the common case early in the network's life
+            // and it must be cheap.
+            if best == 0 && started.elapsed() >= first_byte {
+                let _ = self.session.delete(handle.id().into(), false).await;
+                return Ok(false);
+            }
+            // It started and stopped. Same verdict as the HTTP watchdog.
+            if best > 0 && last_progress.elapsed() >= stall {
+                let _ = self.session.delete(handle.id().into(), false).await;
+                return Ok(false);
+            }
+            // A swarm that is slower than our own CDN is not worth the slot.
+            // `expected_size` bounds the wait: a 4 MB sermon that has taken five
+            // minutes is not going to arrive.
+            let cap = std::time::Duration::from_secs(
+                60 + (expected_size / (32 * 1024)).min(900),
+            );
+            if started.elapsed() >= cap {
+                let _ = self.session.delete(handle.id().into(), false).await;
+                return Ok(false);
+            }
+        }
+    }
+
     /// Seed one completed file in place.
     ///
     /// `known_info_hash` — the master-list info_hash for this file, if the

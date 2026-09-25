@@ -33,6 +33,31 @@ pub async fn check_seed_access(client: &reqwest::Client, node_id: &str) -> bool 
         && data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// Pull the network-wide settings the console publishes out of a heartbeat
+/// response: `(source_mode, master_list_version)`.
+///
+/// The console has shipped these on every beat since the beginning and the CLI
+/// read neither. `source_mode` is the switch that decides whether a node uses
+/// the swarm at all, and "Force all nodes to refresh" wrote a value nothing
+/// looked at — so both controls existed, were documented, were delivered, and
+/// did nothing. Unknown or missing values return None rather than a guess: a
+/// malformed config should change no behaviour.
+pub fn remote_config(body: &Value) -> (Option<String>, Option<String>) {
+    let cfg = body.get("config");
+    let mode = cfg
+        .and_then(|c| c.get("source_mode"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| matches!(v.as_str(), "cdn" | "p2p" | "hybrid"));
+    // master_list_version travels INSIDE config, matching the app.
+    let mlv = cfg
+        .and_then(|c| c.get("master_list_version"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    (mode, mlv)
+}
+
 /// Ask the admin to grant THIS node seed access. Mirrors the desktop app's
 /// `requestSeedAccess()`: POST /api/seed/request { node_id, email } → the row
 /// appears in the pending queue on /admin/seed-nodes.
