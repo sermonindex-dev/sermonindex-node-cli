@@ -42,13 +42,51 @@ pub async fn check_seed_access(client: &reqwest::Client, node_id: &str) -> bool 
 /// looked at — so both controls existed, were documented, were delivered, and
 /// did nothing. Unknown or missing values return None rather than a guess: a
 /// malformed config should change no behaviour.
+/// Fold whatever the console sent into the three values this binary acts on.
+///
+/// WHY THIS IS NOT JUST A `matches!`
+///
+/// The stored values are `cdn | hybrid | p2p`, but the desktop app has always
+/// used `cdn | p2p-primary | p2p-only` for the same three things internally,
+/// and its 0.0.339 parser read the WIRE value with substring tests — so
+/// `"hybrid"` matched none of them and every app node silently fell back to the
+/// CDN while the console insisted the network was on P2P Primary. That bug cost
+/// real money before anybody noticed, because nothing anywhere said which mode
+/// was actually in force.
+///
+/// The lesson is not "fix the app", it is that two spellings of one setting
+/// exist in this system and a node must never quietly do the wrong thing when
+/// handed the other one. So both are accepted here, and anything genuinely
+/// unrecognised SAYS SO on stderr instead of returning None and leaving the
+/// node on its previous mode with no explanation.
+fn normalise_source_mode(v: &str) -> Option<String> {
+    if v.is_empty() {
+        return None;          // the key was there and blank; nothing to say
+    }
+    match v {
+        "hybrid" | "p2p-primary" | "p2p_primary" => Some("hybrid".to_string()),
+        "p2p" | "p2p-only" | "p2p_only" => Some("p2p".to_string()),
+        "cdn" | "cdn-primary" | "archive" | "archive+cdn" => Some("cdn".to_string()),
+        other => {
+            eprintln!(
+                "[config] the console sent a content source this version does not \
+                 recognise ({other:?}) — staying on the current one. Upgrade the \
+                 node software if the console offers a mode this build predates."
+            );
+            None
+        }
+    }
+}
+
 pub fn remote_config(body: &Value) -> (Option<String>, Option<String>) {
+    // (kept as-is for the two callers below; the numeric settings have their own
+    // reader so a malformed number cannot swallow the mode as well)
     let cfg = body.get("config");
     let mode = cfg
         .and_then(|c| c.get("source_mode"))
         .and_then(|v| v.as_str())
         .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| matches!(v.as_str(), "cdn" | "p2p" | "hybrid"));
+        .and_then(|v| normalise_source_mode(&v));
     // master_list_version travels INSIDE config, matching the app.
     let mlv = cfg
         .and_then(|c| c.get("master_list_version"))
@@ -56,6 +94,28 @@ pub fn remote_config(body: &Value) -> (Option<String>, Option<String>) {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
     (mode, mlv)
+}
+
+/// The numeric network settings: `(max_concurrent_downloads, heartbeat_interval)`.
+///
+/// Both were shipped on every heartbeat and read by NOTHING — the CLI slept a
+/// hard-coded 300 seconds and sized its download pool purely from local config,
+/// so an admin moving either slider on the console changed nothing anywhere.
+/// Values outside a sane range are ignored rather than clamped silently: a
+/// typo'd `heartbeat_interval` of 1 would otherwise have 53 nodes hammering the
+/// server once a second, and the safest reading of a nonsense number is that
+/// nobody meant it.
+pub fn remote_limits(body: &Value) -> (Option<u64>, Option<u64>) {
+    let cfg = body.get("config");
+    let num = |k: &str| -> Option<u64> {
+        cfg.and_then(|c| c.get(k)).and_then(|v| {
+            v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+    };
+    (
+        num("max_concurrent_downloads").filter(|n| (1..=16).contains(n)),
+        num("heartbeat_interval").filter(|n| (60..=3600).contains(n)),
+    )
 }
 
 /// Ask the admin to grant THIS node seed access. Mirrors the desktop app's
@@ -226,6 +286,7 @@ pub async fn beat(
     geo: &Option<Value>,
     reachable: Option<bool>,
     seed_granted: bool,
+    seeded: Option<Value>,
 ) -> Option<Value> {
     let cov = shared.coverage_pct();
     let g = geo.clone().unwrap_or_else(|| json!({}));
@@ -254,7 +315,9 @@ pub async fn beat(
         "protocol": "bittorrent",
         "app_version": APP_VERSION,
         "node_type": node_type,
-        "content_mode": "cdn",
+        // The node's OWN view of what it fetches. Reported so the console can
+        // show what each node is really doing, not only what it was told.
+        "content_mode": shared.source_mode.lock().unwrap().clone(),
         "seed_scope": shared.scope,
         "seed_progress": cov,
         "seed_verified": cov >= 95.0,
@@ -262,6 +325,15 @@ pub async fn beat(
         "files_stored": shared.held.load(Ordering::Relaxed),
         "storage_used_bytes": shared.storage_bytes.load(Ordering::Relaxed),
         "uploaded_bytes": shared.uploaded_bytes.load(Ordering::Relaxed),
+        // WHERE THIS NODE'S FILES CAME FROM, this run. The console adds these
+        // up across the fleet, which is the only way to answer whether moving
+        // the network to P2P Primary actually moved any traffic off the CDN.
+        // Sent by every node, seeding or not — a node that only downloads is
+        // exactly the one whose source matters to the bill.
+        "swarm_files": shared.swarm_files.load(Ordering::Relaxed),
+        "swarm_bytes": shared.swarm_bytes.load(Ordering::Relaxed),
+        "http_files": shared.http_files.load(Ordering::Relaxed),
+        "http_bytes": shared.http_bytes.load(Ordering::Relaxed),
         "peers_connected": shared.peers.load(Ordering::Relaxed),
         // Direction. `peers_connected` is a bare total and cannot distinguish
         // "people are taking sermons from me" from "I am taking from them" —
@@ -290,6 +362,17 @@ pub async fn beat(
             "uptime": shared.started.elapsed().as_secs(),
         }
     });
+    // seeded_torrents is attached ONLY when the caller passes it — see the
+    // guard in the server. Absent means "not reporting this beat, keep what you
+    // have"; an empty object would mean "I am seeding nothing" and wipe the
+    // rows. Sending the full set every beat is what made this unaffordable for
+    // a headless seed in the first place, so the caller sends it on the first
+    // beat and then hourly.
+    if let Some(list) = seeded {
+        if let Some(o) = body.as_object_mut() {
+            o.insert("seeded_torrents".to_string(), list);
+        }
+    }
     // Ask to be checked when we have a global IPv6 address and nothing has
     // confirmed us recently. A node that is already confirmed does not need the
     // favour, and one without IPv6 cannot be helped this way.

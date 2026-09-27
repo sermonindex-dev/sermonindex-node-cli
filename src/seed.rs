@@ -536,6 +536,40 @@ impl Seeder {
     }
 
     /// Number of torrents currently in the session.
+    /// The torrents this node is LIVE on right now, as `(name, info_hash)`.
+    ///
+    /// Live, not held — and the distinction is the whole point. Under rotation
+    /// the node keeps its entire library registered but PAUSED and brings a
+    /// window live at a time; a paused torrent announces to nobody and serves
+    /// nobody. "What is this node sharing" therefore means the live window,
+    /// which is also, conveniently, bounded: `config window` caps it, so this
+    /// never returns the 40,000 entries that made reporting impossible before.
+    ///
+    /// Capped again at `max` regardless, because a cap that depends on another
+    /// setting being sane is not a cap.
+    pub fn live_torrents(&self, max: usize) -> Vec<(String, String)> {
+        self.session.with_torrents(|iter| {
+            let mut out = Vec::new();
+            for (_, t) in iter {
+                if out.len() >= max {
+                    break;
+                }
+                // Only torrents actually live and complete are being served.
+                let st = t.stats();
+                if !st.finished {
+                    continue;
+                }
+                if !matches!(st.state, librqbit::TorrentStatsState::Live) {
+                    continue;
+                }
+                if let Some(name) = t.name() {
+                    out.push((name, t.info_hash().as_string()));
+                }
+            }
+            out
+        })
+    }
+
     pub fn torrent_count(&self) -> usize {
         self.session.with_torrents(|iter| iter.count())
     }

@@ -122,6 +122,10 @@ body.compact #stage{transform:none!important}
   <span class="sub">Seed Node</span>
   <div class="spacer"></div>
   <div id="status" class="pill"><span class="dot"></span><span id="statustxt">—</span></div>
+  <!-- Where this node fetches content from, in the console's own words. It is
+       set network-wide and arrives on a heartbeat, so a node that has not
+       reported in yet says so rather than guessing. -->
+  <div id="srcmode" class="pill" title="Set on the admin console, for the whole network">&mdash;</div>
   <div id="clock" class="clock">--:--</div>
   <button class="tbtn" id="fsbtn" title="Full screen"></button>
   <button class="tbtn" id="viewbtn" title="Toggle screen size"></button>
@@ -187,18 +191,46 @@ function spark(arr,color,fmt,h){
     '<text x="'+(w-pad)+'" y="14" text-anchor="end" font-size="12" font-weight="700" fill="'+color+'">'+(fmt?fmt(arr[arr.length-1]):arr[arr.length-1])+'</text></svg>';
 }
 function catcol(n){return n.online===false?'#5c6b7a':(NC[n.category]||NC.seed)}
-// map styled exactly like the node software: navy radial, faint grid, dim continents, glowing category dots
+
+/* The swarm-vs-CDN split for this run, as one line plus a bar.
+   Bytes, not files: a node that pulled one enormous video off the CDN and two
+   hundred short clips off the swarm is mostly still costing us money, and the
+   file count would say the opposite. */
+function srcsplit(n){
+  var sb=Number(n.swarm_bytes||0), hb=Number(n.http_bytes||0), tot=sb+hb;
+  if(!tot) return '<div class="big" style="color:var(--muted)">—</div>'+
+                  '<div class="sm">nothing downloaded since this node started</div>';
+  var pct=100*sb/tot;
+  var col=pct>=50?'var(--green)':(pct>0?'var(--goldtext)':'var(--seedblue)');
+  return '<div class="big" style="color:'+col+'">'+(pct<10?pct.toFixed(1):Math.round(pct))+'% peers</div>'+
+    '<div style="height:6px;border-radius:3px;overflow:hidden;background:rgba(255,255,255,.08);margin:6px 0 5px">'+
+      '<i style="display:block;height:100%;width:'+pct.toFixed(1)+'%;background:'+col+'"></i></div>'+
+    '<div class="sm">'+fb(sb)+' from other nodes \u00b7 '+fb(hb)+' from Archive.org/CDN</div>';
+}
+// Map styled exactly like the node software: navy radial, faint grid, dim
+// continents, glowing category dots.
+//
+// 0.3.1 — the ground, the grid and the threads were all lifted a step, matching
+// the app's NetworkPage.jsx and the console's ported painter to the value. The
+// old palette was so near black that on a small panel — a Pi's 3.5" screen,
+// which is exactly what this display is for — an unlit continent was
+// indistinguishable from the sea and the gold threads between nodes vanished
+// altogether. Three displays, one picture: if you change these, change those.
+//
+// This one stays EQUIRECTANGULAR rather than Mercator. On a screen this size,
+// dots far enough apart to tell apart matter more than accurate shapes, and the
+// flat grid puts the equator across the middle where a glance expects it.
 function worldmap(nodes){
   var mw=1000,mh=500;
   function px(lon){return (Number(lon)+180)/360*mw}
   function py(lat){return (90-Number(lat))/180*mh}
   var grid='';
-  for(var gy=1;gy<6;gy++)grid+='<line x1="0" y1="'+(gy*mh/6)+'" x2="'+mw+'" y2="'+(gy*mh/6)+'" stroke="rgba(30,51,72,0.5)" stroke-width="1"/>';
-  for(var gx=1;gx<12;gx++)grid+='<line x1="'+(gx*mw/12)+'" y1="0" x2="'+(gx*mw/12)+'" y2="'+mh+'" stroke="rgba(30,51,72,0.5)" stroke-width="1"/>';
+  for(var gy=1;gy<6;gy++)grid+='<line x1="0" y1="'+(gy*mh/6)+'" x2="'+mw+'" y2="'+(gy*mh/6)+'" stroke="rgba(52,84,116,0.5)" stroke-width="1"/>';
+  for(var gx=1;gx<12;gx++)grid+='<line x1="'+(gx*mw/12)+'" y1="0" x2="'+(gx*mw/12)+'" y2="'+mh+'" stroke="rgba(52,84,116,0.5)" stroke-width="1"/>';
   var lines='',me=(nodes||[]).filter(function(n){return n.self})[0];
   if(me&&me.lat!=null)(nodes||[]).forEach(function(n){
     if(n.self||n.lat==null||n.online===false)return;
-    lines+='<line x1="'+px(me.lon).toFixed(1)+'" y1="'+py(me.lat).toFixed(1)+'" x2="'+px(n.lon).toFixed(1)+'" y2="'+py(n.lat).toFixed(1)+'" stroke="rgba(212,175,55,0.30)" stroke-width="1" stroke-dasharray="4 7"/>';
+    lines+='<line x1="'+px(me.lon).toFixed(1)+'" y1="'+py(me.lat).toFixed(1)+'" x2="'+px(n.lon).toFixed(1)+'" y2="'+py(n.lat).toFixed(1)+'" stroke="rgba(212,175,55,0.55)" stroke-width="1.1" stroke-dasharray="4 6"/>';
   });
   var marks='',glowDefs='',glowId={},glowN=0;
   (nodes||[]).forEach(function(n){
@@ -227,9 +259,9 @@ function worldmap(nodes){
   });
   var bgid='mbg';
   return '<svg class="mapsvg" viewBox="0 0 '+mw+' '+mh+'" preserveAspectRatio="xMidYMid meet">'+
-    '<defs><radialGradient id="'+bgid+'" cx="50%" cy="50%" r="70%"><stop offset="0" stop-color="#0c1824"/><stop offset="1" stop-color="#060c14"/></radialGradient>'+glowDefs+'</defs>'+
+    '<defs><radialGradient id="'+bgid+'" cx="50%" cy="50%" r="70%"><stop offset="0" stop-color="#132435"/><stop offset="1" stop-color="#0a1420"/></radialGradient>'+glowDefs+'</defs>'+
     '<rect x="0" y="0" width="'+mw+'" height="'+mh+'" fill="url(#'+bgid+')"/>'+grid+
-    '<path d="'+WORLD+'" fill="rgba(22,34,48,0.72)" stroke="rgba(50,80,110,0.35)" stroke-width="0.6"/>'+
+    '<path d="'+WORLD+'" fill="rgba(32,50,70,0.82)" stroke="rgba(78,116,152,0.45)" stroke-width="0.6"/>'+
     lines+marks+'</svg>';
 }
 function legend(){return '<div class="maplegend">'+
@@ -364,6 +396,18 @@ function render(){
   var n=S.node||{},sy=S.system||{},tr=S.trends||{},nw=S.network||{};
   var reach=n.peers!=null&&n.peers>0;
   $('#status').className='pill'+(reach?' on':'');
+
+  /* The three content-source names, word for word as the console, the desktop
+     app and `source_mode_names` in config.rs say them. Four places, one set of
+     words: an operator comparing a screen against the console must never have
+     to work out whether two different phrasings mean the same thing. */
+  var SRCNAME={cdn:'Archive.org + CDN',hybrid:'P2P Primary',p2p:'P2P Only'};
+  var sm=(d.node&&d.node.source_mode)||'';
+  var el=$('#srcmode');
+  if(el){
+    el.textContent = sm ? (SRCNAME[sm]||sm) : 'source: waiting for the console';
+    el.className = 'pill'+(sm==='hybrid'||sm==='p2p'?' on':'');
+  }
   $('#statustxt').textContent=(n.available===false?'STARTING':'SEEDING')+(reach?' · '+n.peers+' PEERS':' · IDLE');
   var p=cur();
   if(p==='map'){
@@ -407,6 +451,12 @@ function render(){
              '<div class="card"><div class="lbl">Peers served</div><div class="big" style="color:var(--dirin)">'+fn(n.peers_in_peak!=null?n.peers_in_peak:n.peers)+'</div><div class="sm">came to you · '+fn(n.peers)+' connected now</div></div>'+
              '<div class="card"><div class="lbl">Uploading</div><div class="big" style="color:var(--seedblue)">'+fbps(sy.up_bps)+'</div><div class="sm">to the swarm</div></div>'+
              '<div class="card"><div class="lbl">Library size</div><div class="big">'+fb(n.storage_bytes||sy.disk_used)+'</div><div class="sm">uptime '+fdur(n.uptime_s)+'</div></div>'+
+             /* WHERE THE FILES CAME FROM. The one tile that says whether the
+                peer network is doing anything for this node — and, added up
+                across the fleet, whether it is doing anything for the project.
+                Spans both columns because the split is the message, not either
+                number on its own. */
+             '<div class="card" style="grid-column:1/-1"><div class="lbl">Fetched from</div>'+srcsplit(n)+'</div>'+
            '</div>'+
          '</div>'+
        '</div>'+

@@ -32,13 +32,40 @@ download cards on `/node-software/` update themselves.
 
 ## Verify after a release
 
+On the release machine (a Mac), the only check worth running is that the CDN has
+the new version:
+
 ```bash
 curl -fsS "https://sermonindex4.b-cdn.net/node-cli/releases/releases.json?t=$(date +%s)" \
   | python3 -m json.tool | head -30
-
-cd /tmp && curl -fsSL https://sermonindex4.b-cdn.net/node-cli/install.sh -o si.sh
-NO_SERVICE=1 PREFIX=/tmp/sitest bash si.sh && /tmp/sitest/bin/sermonindex-node version
 ```
+
+### DO NOT run the installer on macOS
+
+> CI builds **Linux musl binaries only** — `x86_64-unknown-linux-musl` and
+> `aarch64-unknown-linux-musl`. There is no macOS asset, and there is not meant
+> to be one: nobody runs a seed node on a Mac laptop.
+>
+> `install.sh` on a Mac therefore finds no matching binary and falls through to
+> its **build-from-source** path — a full `cargo build --release`, several
+> minutes, testing nothing that a local `cargo build --release` has not already
+> tested. And with a `PREFIX` outside `$HOME` it asks for your **sudo
+> password** before installing, which looks alarming and is simply the script
+> doing what it was told.
+>
+> If that happens: Ctrl-C. Nothing has been installed and nothing is wrong.
+
+The install smoke test belongs on a **Linux** box — a spare node, a Pi, any
+cheap VM — because the published Linux binary is the thing being tested:
+
+```bash
+# ON A LINUX MACHINE
+cd /tmp && curl -fsSL https://sermonindex4.b-cdn.net/node-cli/install.sh -o si.sh
+NO_SERVICE=1 PREFIX=$HOME/.local bash si.sh && ~/.local/bin/sermonindex-node version
+```
+
+`PREFIX` under `$HOME` on purpose: the installer only reaches for `sudo` when
+asked to write outside it, and a smoke test has no business needing root.
 
 ## Required repository secrets
 

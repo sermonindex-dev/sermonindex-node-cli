@@ -499,6 +499,72 @@ pub fn prefer_archive(settings: &Value, scope: &str) -> bool {
     }
 }
 
+/// One line naming what this node does for content, for `status` and the
+/// startup banner.
+///
+/// The desktop app has always shown its mode in a badge; the CLI named it
+/// nowhere, so "is my node using the swarm?" was unanswerable without watching
+/// traffic. Two separate settings decide it and both belong on the line:
+/// `source_mode` (network-wide, set on the console) says whether the swarm is
+/// used at all, and `content_mode` (local, `config source`) decides which HTTP
+/// source leads when it is not.
+pub fn source_mode_line(settings: &Value, scope: &str) -> String {
+    let http = if prefer_archive(settings, scope) { "Archive.org, then CDN" } else { "CDN, then Archive.org" };
+    let mode = content_mode(settings);
+    let suffix = if mode == "auto" { format!(" (auto for {scope} scope)") } else { String::new() };
+
+    // NAME THE NETWORK-WIDE MODE, not just the HTTP half.
+    //
+    // This line used to end "content source is set on the console" and stop
+    // there, which told an operator where the switch lived but never which way
+    // it was thrown. Somebody who had just moved the whole network to P2P
+    // Primary had no way to confirm from the node that it had landed — the one
+    // question `status` exists to answer.
+    //
+    // The value arrives on a heartbeat, so a one-shot command like `status`
+    // cannot fetch it; the last one seen is written into the settings file when
+    // it changes (see the heartbeat handler in main.rs) and read back here.
+    let seen = settings.get("last_source_mode").and_then(|v| v.as_str()).unwrap_or("");
+    if seen.is_empty() {
+        format!("{http}{suffix} — content source is set on the console")
+    } else {
+        let (name, says) = source_mode_names(seen);
+        format!("{name} — {says}\n              HTTP fallback: {http}{suffix}")
+    }
+}
+
+/// The ONE set of names for the three content-source modes.
+///
+/// Returns `(name, what it does)` for a stored `source_mode` value.
+///
+/// These are the desktop app's labels and subtitles, word for word, and they
+/// are canonical: the console, the app and this binary all say the same thing
+/// now. Before, each surface had invented its own — the console said "Hybrid",
+/// the app said "P2P Primary", the app's own title-bar badge said a third
+/// thing, and the CLI a fourth. One setting, four names, no way for an operator
+/// to tell that a console reading "Hybrid" and an app reading "Archive.org +
+/// CDN" were describing the same control and disagreeing about its value.
+///
+/// The stored values stay `cdn | hybrid | p2p`; only the names are shared.
+/// Renaming the values would break every node older than 0.3.0, which matches
+/// exactly those three strings.
+pub fn source_mode_names(mode: &str) -> (&'static str, &'static str) {
+    match mode {
+        "hybrid" => (
+            "P2P Primary",
+            "Download from the peer swarm first, Archive.org and CDN as fallback",
+        ),
+        "p2p" => (
+            "P2P Only",
+            "Fully decentralized — peer network only, no CDN dependency",
+        ),
+        _ => (
+            "Archive.org + CDN",
+            "Download from Archive.org (free), Bunny CDN as fallback — files are seeded to the peer swarm after download",
+        ),
+    }
+}
+
 /// How many files to fetch at once. 1–16, default 4.
 ///
 /// Hard-coded at 4 until 0.2.7. Four is right for a home connection and absurd

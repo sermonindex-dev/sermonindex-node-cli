@@ -384,6 +384,7 @@ fn run_status() -> Result<()> {
     println!("SermonIndex node");
     println!("  node_id:    {id}");
     println!("  scope:      {scope}");
+    println!("  content:    {}", config::source_mode_line(&settings, &scope));
     println!("  data dir:   {}", config::data_dir().display());
     println!("  storage:    {}", config::downloads_dir(&settings).display());
     println!(
@@ -951,6 +952,11 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     }
 
     println!("SermonIndex node {} — scope={scope}", env!("CARGO_PKG_VERSION"));
+    // Say what this node will actually DO for content, not just what scope it
+    // holds. The desktop app puts its mode in a badge in the title bar; the CLI
+    // had nowhere at all that named it, so an operator asking "is my node using
+    // the swarm?" had no way to find out short of reading traffic.
+    println!("  content:    {}", config::source_mode_line(&settings, &scope));
     println!("  node_id {node_id}");
     println!("  storage {}", config::downloads_dir(&settings).display());
     // The port named here is the one someone would put in a router rule, so it
@@ -1067,18 +1073,61 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                 // free push channel — the request is happening regardless — so
                 // a release can reach the fleet in one beat instead of waiting
                 // out the 6-hour manifest poll.
-                if let Some(body) = heartbeat::beat(&cl, &sh, &geo, reachable, granted).await {
+                // What this node is SHARING, not what it holds — prepared by
+                // the seed-stats poller (which is the task that has the
+                // seeder) and taken here. Absent on most beats by design: the
+                // server keeps the rows between reports, so an accurate figure
+                // costs one bounded payload an hour instead of ~1.6 MB every
+                // five minutes. Before this the CLI sent nothing at all and
+                // every headless node read "sharing 0" while holding the whole
+                // archive.
+                let seeded_now = sh.seeded_report.lock().unwrap().take();
+
+                if let Some(body) = heartbeat::beat(&cl, &sh, &geo, reachable, granted, seeded_now).await {
                     if let Some(v) = update::from_heartbeat(&body) {
                         *sh.update_available.lock().unwrap() = Some(v);
                     }
                     // Network-wide settings from the console. Both of these were
                     // delivered on every beat and read by nothing until 0.3.0.
                     let (mode, mlv) = heartbeat::remote_config(&body);
+                    let (dl_max, hb) = heartbeat::remote_limits(&body);
+                    if let Some(n) = dl_max {
+                        if sh.dl_ceiling.swap(n, Ordering::Relaxed) != n {
+                            println!("[config] network download ceiling is now {n} files at once");
+                        }
+                    }
+                    if let Some(n) = hb {
+                        if sh.hb_interval.swap(n, Ordering::Relaxed) != n {
+                            println!("[config] heartbeat interval is now {n}s");
+                        }
+                    }
                     if let Some(m) = mode {
                         let mut cur = sh.source_mode.lock().unwrap();
                         if *cur != m {
-                            println!("[config] content source is now '{m}' (set on the console)");
-                            *cur = m;
+                            // Name the behaviour, not just the key. An operator
+                            // reading a log should not have to remember what the
+                            // third option was called.
+                            // Same words the console and the app use.
+                            let (name, says) = config::source_mode_names(&m);
+                            println!("[config] Content source: {name} — {says}");
+                            *cur = m.clone();
+                            drop(cur);
+                            // Remembered on disk so `status` — a one-shot
+                            // command that never sees a heartbeat — can still
+                            // say which way the switch is thrown. It is a
+                            // CACHE of what the console last said, not a local
+                            // setting: the console remains the authority and
+                            // overwrites this on the next beat.
+                            let mut st = config::load_settings();
+                            if let Some(o) = st.as_object_mut() {
+                                o.insert(
+                                    "last_source_mode".to_string(),
+                                    serde_json::Value::String(m.clone()),
+                                );
+                            }
+                            if let Err(e) = config::save_settings(&st) {
+                                eprintln!("[config] could not remember the content source: {e:#}");
+                            }
                         }
                     }
                     if let Some(v) = mlv {
@@ -1106,7 +1155,13 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(300)).await;
+                // Was a hard-coded 300. `heartbeat_interval` on the console
+                // now moves it, within the 60–3600 the reader enforces.
+                let every = match sh.hb_interval.load(Ordering::Relaxed) {
+                    0 => 300,
+                    n => n,
+                };
+                tokio::time::sleep(Duration::from_secs(every)).await;
             }
         });
         let cl = client.clone();
@@ -1480,6 +1535,21 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                 sh.seed_up_bps.store(up, Ordering::Relaxed);
                 sh.peers.store(peers, Ordering::Relaxed);
                 sh.torrents.store(torrents, Ordering::Relaxed);
+                // Prepare the seeded-torrent report on the first tick and then
+                // hourly. This task is the one holding the seeder, and it
+                // already runs on a timer — so the cadence lives here and the
+                // heartbeat simply sends whatever is waiting. 2000 is a hard
+                // cap on top of the rotation window: a cap that depends on
+                // another setting being sane is not a cap.
+                if tick % 360 == 0 {
+                    let live = s.live_torrents(2000);
+                    let mut m = serde_json::Map::new();
+                    for (name, hash) in live {
+                        let id = name.rsplit_once('.').map(|(a, _)| a).unwrap_or(&name).to_string();
+                        m.insert(id, serde_json::json!({ "info_hash": hash }));
+                    }
+                    *sh.seeded_report.lock().unwrap() = Some(serde_json::Value::Object(m));
+                }
                 if tick % 6 == 0 {
                     // every ~60 s
                     let d = s.directions();
@@ -1530,7 +1600,17 @@ async fn run_daemon(args: &[String]) -> Result<()> {
             .cloned()
             .collect();
         let total = entries.len();
-        let workers = config::download_workers(&settings);
+        // The operator's own `config downloads <n>`, held under the network
+        // ceiling the console publishes. Below it freely; never above it — that
+        // is what makes the console value a ceiling rather than a second,
+        // competing setting that silently wins or loses depending on order.
+        let workers = {
+            let local = config::download_workers(&settings);
+            match shared.dl_ceiling.load(Ordering::Relaxed) {
+                0 => local,
+                ceiling => local.min(ceiling as usize),
+            }
+        };
         let prefer_archive = config::prefer_archive(&settings, &scope);
         println!(
             "[download] {} files to fetch ({workers} in parallel, {} first)",
@@ -1676,6 +1756,25 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     };
                     #[cfg(not(feature = "seed"))]
                     let outcome = download::ensure_file(&client, &urls, &dest, e.size).await;
+
+                    /* WHERE IT CAME FROM. Counted only when the file actually
+                       landed, so a failed CDN attempt after a failed swarm
+                       attempt does not inflate either side. This is the figure
+                       that tells an operator — and the console — whether P2P
+                       Primary is doing anything at all. */
+                    if matches!(outcome, Ok(download::Outcome::Downloaded)) {
+                        #[cfg(feature = "seed")]
+                        let via_swarm = got_from_swarm;
+                        #[cfg(not(feature = "seed"))]
+                        let via_swarm = false;
+                        if via_swarm {
+                            shared.swarm_files.fetch_add(1, Ordering::Relaxed);
+                            shared.swarm_bytes.fetch_add(e.size, Ordering::Relaxed);
+                        } else {
+                            shared.http_files.fetch_add(1, Ordering::Relaxed);
+                            shared.http_bytes.fetch_add(e.size, Ordering::Relaxed);
+                        }
+                    }
                     if matches!(outcome, Ok(download::Outcome::NoSpace)) {
                         // Say it ONCE, loudly, and stop asking for more. The
                         // node keeps seeding everything it already holds —

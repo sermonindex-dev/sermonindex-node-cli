@@ -29,6 +29,23 @@ pub struct Shared {
     /// poll interval each tick). Reported as `uploaded_bytes` — the admin's
     /// "Data Transferred" / "Uploaded across granted seeds".
     pub uploaded_bytes: AtomicU64,
+    /// ── WHERE THE FILES ACTUALLY CAME FROM ──────────────────────────────
+    ///
+    /// Counted because nothing counted it. `source_mode` could be set to P2P
+    /// Primary network-wide and every node would obediently try the swarm
+    /// first — and there was no figure anywhere, on any screen, saying whether
+    /// a single byte had ever arrived that way. The swarm either works or it
+    /// does not, and "we think so" is not an answer when the alternative is a
+    /// CDN bill.
+    ///
+    /// Counted for the life of the process, not persisted: the question is
+    /// "is this node using the swarm", which is about now, and a total carried
+    /// across restarts from before the feature existed would answer a
+    /// different one.
+    pub swarm_files: AtomicU64,
+    pub swarm_bytes: AtomicU64,
+    pub http_files: AtomicU64,
+    pub http_bytes: AtomicU64,
     pub peers: AtomicU64,
     /// Peers that DIALLED US, summed across live torrents (all address
     /// families). This is the only honest answer to "am I actually serving the
@@ -93,6 +110,24 @@ pub struct Shared {
     /// no behaviour on any node. That is now the one place the swarm gets
     /// switched on, so it had better be read.
     pub source_mode: Mutex<String>,
+    /// The next `seeded_torrents` report, prepared by the seed-stats poller and
+    /// TAKEN by the heartbeat.
+    ///
+    /// The two tasks cannot simply call each other: the heartbeat is spawned
+    /// before the seeder exists. Handing the report through here also gives the
+    /// cadence for free — the poller decides how often a report is worth making
+    /// (first tick, then hourly), the heartbeat just sends whatever is waiting,
+    /// and `take()` means a report is sent exactly once. On the beats where
+    /// nothing is waiting the field is omitted entirely, which the server reads
+    /// as "keep this node's rows" rather than "it is sharing nothing".
+    pub seeded_report: Mutex<Option<serde_json::Value>>,
+    /// Network-wide ceiling on concurrent downloads (`max_concurrent_downloads`
+    /// on the console). 0 = unset. The node's own `config downloads <n>` may go
+    /// BELOW this but never above it — that is what makes it a ceiling rather
+    /// than a second, competing setting.
+    pub dl_ceiling: AtomicU64,
+    /// Seconds between heartbeats (`heartbeat_interval`). 0 = use the default.
+    pub hb_interval: AtomicU64,
     /// The `master_list_version` the console publishes. "Force all nodes to
     /// refresh" bumps it; a node that sees it change asks for a sweep. Also dead
     /// before 0.3.0, for the same reason.
@@ -156,6 +191,10 @@ impl Shared {
             total: AtomicU64::new(0),
             storage_bytes: AtomicU64::new(0),
             uploaded_bytes: AtomicU64::new(0),
+            swarm_files: AtomicU64::new(0),
+            swarm_bytes: AtomicU64::new(0),
+            http_files: AtomicU64::new(0),
+            http_bytes: AtomicU64::new(0),
             peers: AtomicU64::new(0),
             peers_in: AtomicU64::new(0),
             peers_out: AtomicU64::new(0),
@@ -179,7 +218,17 @@ impl Shared {
             // because until enough nodes are complete the swarm is the slower
             // answer and a silent default would degrade every operator's
             // experience to prove a point about architecture.
-            source_mode: Mutex::new("cdn".to_string()),
+            // EMPTY, not "cdn". Seeded with a real mode, a network already
+            // set to Archive.org + CDN matched the default and the first
+            // heartbeat announced nothing at all — so the log never stated
+            // which mode the node was in unless somebody happened to change
+            // it. Empty behaves exactly as "cdn" everywhere it is compared
+            // (the download path tests for "p2p" and "hybrid" by name), and
+            // guarantees the first beat of every run prints the setting.
+            source_mode: Mutex::new(String::new()),
+            seeded_report: Mutex::new(None),
+            dl_ceiling: AtomicU64::new(0),
+            hb_interval: AtomicU64::new(0),
             remote_ml_version: Mutex::new(String::new()),
             natpmp: std::sync::Arc::new(Mutex::new("off".to_string())),
             pending_check: Mutex::new(None),
@@ -360,6 +409,19 @@ impl Shared {
             "disk_full": self.disk_full.load(Ordering::Relaxed),
             "seed_granted": self.seed_granted.load(Ordering::Relaxed),
             "category": self.category(),
+            // The network-wide content source, so the kiosk display can state
+            // it. Someone standing in front of a Pi on a shelf has no terminal
+            // to run `status` in, and "is this machine using the swarm yet?"
+            // is exactly the question that screen is there to answer.
+            "source_mode": self.source_mode.lock().unwrap().clone(),
+            // Swarm vs HTTP, since this run started. The kiosk shows it, the
+            // heartbeat carries it, and the console adds it up across the
+            // fleet — so "did moving the network to P2P Primary do anything"
+            // has an answer instead of an opinion.
+            "swarm_files": self.swarm_files.load(Ordering::Relaxed),
+            "swarm_bytes": self.swarm_bytes.load(Ordering::Relaxed),
+            "http_files": self.http_files.load(Ordering::Relaxed),
+            "http_bytes": self.http_bytes.load(Ordering::Relaxed),
             // Direction. `peers` above is a bare total and cannot answer the
             // question that matters; these can.
             "peers_in": self.peers_in.load(Ordering::Relaxed),
