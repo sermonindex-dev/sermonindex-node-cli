@@ -9,3 +9,6 @@ secrets*.json
 *.bak
 *.bak-*
 *.orig
+
+# kiosk render check dependencies (installed by npm ci)
+tests/kiosk/node_modules/

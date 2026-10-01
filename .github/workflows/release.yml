@@ -16,7 +16,25 @@ permissions:
   contents: write
 
 jobs:
+  # Runs the kiosk page's render() on every tab against sample /stats data.
+  # 0.3.1 shipped `d.node` where it meant `S.node`: valid syntax, so nothing
+  # flagged it, and every kiosk screen in the field went blank. Only executing
+  # the script finds that class of bug, so no binary is built until it passes.
+  kiosk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Render every kiosk page
+        working-directory: tests/kiosk
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
   build:
+    needs: kiosk
     strategy:
       fail-fast: false
       matrix:

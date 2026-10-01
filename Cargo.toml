@@ -1,6 +1,6 @@
 [package]
 name = "sermonindex-node"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "SermonIndex headless seed node — download, hold, and seed the sermon archive with an optional built-in dashboard."
 authors = ["SermonIndex"]

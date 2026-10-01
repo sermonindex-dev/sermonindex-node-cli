@@ -363,7 +363,10 @@ impl Shared {
             return 0.0;
         }
         let held = self.held.load(Ordering::Relaxed) as f64;
-        ((held / total as f64) * 1000.0).round() / 10.0
+        let pct = ((held / total as f64) * 1000.0).round() / 10.0;
+        // Never 100.0 while a file is missing: 40,030 of 40,042 rounds up to
+        // it, and "100%" on a kiosk or the console is a claim people act on.
+        if held < total as f64 && pct >= 100.0 { 99.9 } else { pct }
     }
 
     /// Rebuild the /stats JSON from a fresh system snapshot + counters + network.

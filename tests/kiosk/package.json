@@ -1,0 +1,11 @@
+{
+  "name": "kiosk-render-check",
+  "private": true,
+  "description": "Runs the kiosk dashboard's render() on every page against sample /stats payloads.",
+  "scripts": {
+    "test": "node run.js ../../assets/dashboard.html"
+  },
+  "dependencies": {
+    "jsdom": "^24.1.3"
+  }
+}
