@@ -19,16 +19,25 @@
 # Options (environment variables):
 #   VERSION=v0.1.9     install a specific version instead of the newest
 #   STORAGE=/mnt/lib   library directory (otherwise ~/.sermonindex/downloads)
-#   SCOPE=full         audio (default, ~400 GB) or full (~2.4 TB)
+#   SCOPE=audio        picks (default: nothing until chosen in the menu), audio
+#                      (~373 GB) or full (~2.4 TB). audio and full make this a
+#                      seed node and need approval from the SermonIndex console.
 #   PREFIX=~/.local    install location (default /usr/local)
 #   NO_SERVICE=1       install the binary only, don't register a service
 #   FROM_SOURCE=1      always compile, even if a binary is available
+#   NODE_USER=greg     the account the node runs as (default: whoever runs this).
+#                      setup.sh, run as root, passes the desktop user — so the
+#                      node never ends up running as root with its library in /root
 set -euo pipefail
 
 CDN="${CDN:-https://sermonindex4.b-cdn.net}"
 FEED="$CDN/node-cli/releases/releases.json"
 PREFIX="${PREFIX:-/usr/local}"
-SCOPE="${SCOPE:-audio}"
+# Whether this run was GIVEN service options, captured before the defaults
+# below fill them in. An upgrade gives none, and must not reset a node's
+# options to the defaults — see the service section.
+SERVICE_OPTS_GIVEN="${SCOPE:-}${STORAGE:-}${MEM_HIGH:-}${MEM_MAX:-}"
+SCOPE="${SCOPE:-}"
 
 c_y=$'\033[1;33m'; c_g=$'\033[1;32m'; c_r=$'\033[1;31m'; c_0=$'\033[0m'
 log(){ printf '\n%s== %s ==%s\n' "$c_y" "$*" "$c_0"; }
@@ -37,6 +46,11 @@ die(){ printf '\n%s✗ %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
 
 need(){ command -v "$1" >/dev/null 2>&1; }
 for t in curl tar; do need "$t" || die "$t is required but not installed."; done
+
+# Who the node runs as, and where that account lives.
+NODE_USER="${NODE_USER:-$(id -un)}"
+NODE_HOME="$(getent passwd "$NODE_USER" 2>/dev/null | cut -d: -f6 || true)"
+NODE_HOME="${NODE_HOME:-$HOME}"
 
 # sudo only where we actually need it (writing outside $HOME).
 SUDO=""
@@ -193,7 +207,7 @@ else
   # low-RAM boards, the binary, and the service — reuse it rather than
   # duplicating that logic here.
   if [ -f build-and-install.sh ]; then
-    if PREFIX="$PREFIX" STORAGE="${STORAGE:-}" SCOPE="$SCOPE" bash build-and-install.sh; then
+    if PREFIX="$PREFIX" STORAGE="${STORAGE:-}" SCOPE="$SCOPE" SERVICE_OPTS_GIVEN="$SERVICE_OPTS_GIVEN" NODE_USER="$NODE_USER" bash build-and-install.sh; then
       ok "source is kept at $SRC (safe to delete once you're happy: rm -rf \"$SRC_KEEP\")"
       log "Done"
       "$PREFIX/bin/sermonindex-node" status 2>/dev/null \
@@ -216,12 +230,29 @@ else
 fi
 
 # ── Service (Linux, binary path only — the source path already did it) ───────
-if [ "$os_tag" = "linux" ] && [ -z "${NO_SERVICE:-}" ] && need systemctl; then
+UNIT_FILE=/etc/systemd/system/sermonindex-node.service
+if [ "$os_tag" = "linux" ] && [ -z "${NO_SERVICE:-}" ] && need systemctl \
+   && [ -f "$UNIT_FILE" ] && [ -z "$SERVICE_OPTS_GIVEN" ]; then
+  # UPGRADE. A service already exists and no options were given, so keep it
+  # exactly as it is and restart it onto the new program.
+  #
+  # Rewriting it here — what every earlier installer did — quietly reset the
+  # node: `--scope audio` replaced a full-library seed's `--scope full`, the
+  # unit took the user running the installer (root, under sudo, with HOME=/root
+  # and an empty library), and any line added by hand was lost. And because it
+  # used `enable --now`, which does nothing to a running service, the new
+  # program then sat unused until a reboot, so none of this showed until later.
+  log "Restarting the existing service on the new version"
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl restart sermonindex-node.service
+  ok "service restarted, settings unchanged"
+elif [ "$os_tag" = "linux" ] && [ -z "${NO_SERVICE:-}" ] && need systemctl; then
   log "Registering the systemd service"
   RAM_MB="$(free -m | awk '/Mem:/{print $2}')"
   MEM_HIGH="${MEM_HIGH:-$(( RAM_MB > 3000 ? RAM_MB - 1400 : RAM_MB * 55 / 100 ))}M"
   MEM_MAX="${MEM_MAX:-$(( RAM_MB > 3000 ? RAM_MB - 1000 : RAM_MB * 70 / 100 ))}M"
-  EXEC="$PREFIX/bin/sermonindex-node start --scope $SCOPE"
+  EXEC="$PREFIX/bin/sermonindex-node start"
+  [ -n "$SCOPE" ] && EXEC="$EXEC --scope $SCOPE"
   [ -n "${STORAGE:-}" ] && EXEC="$EXEC --dir $STORAGE"
   $SUDO tee /etc/systemd/system/sermonindex-node.service >/dev/null <<UNIT
 [Unit]
@@ -231,8 +262,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$(id -un)
-Environment=HOME=$HOME
+User=$NODE_USER
+Environment=HOME=$NODE_HOME
 ExecStart=$EXEC
 Restart=always
 RestartSec=10
@@ -249,7 +280,13 @@ MemorySwapMax=512M
 WantedBy=multi-user.target
 UNIT
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now sermonindex-node.service
+  # `enable --now` only STARTS a stopped service. On an upgrade the service is
+  # already running, so it did nothing: the new binary sat on disk while the
+  # old one kept running until the next reboot, and the node went on reporting
+  # the old version. People reasonably believed they had updated. `restart`
+  # starts it if stopped and swaps it if running.
+  $SUDO systemctl enable sermonindex-node.service
+  $SUDO systemctl restart sermonindex-node.service
   ok "service running (memory ceiling ${MEM_HIGH}/${MEM_MAX} of ${RAM_MB}M)"
   if ! grep -qw memory /sys/fs/cgroup/cgroup.controllers 2>/dev/null; then
     printf '\n  ! The kernel memory cgroup controller is OFF, so that ceiling is not\n'

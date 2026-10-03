@@ -45,6 +45,17 @@ body.compact #stage{transform:none!important}
  border:1px solid rgba(255,255,255,.28);color:var(--headertext);display:flex;align-items:center;gap:6px}
 .pill .dot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.5)}
 .pill.on .dot{background:#7fdc6b;box-shadow:0 0 7px #7fdc6b}
+.pill{white-space:nowrap}
+.pill.upd{background:var(--brandgold);color:#3A3417;border-color:rgba(0,0,0,.18);cursor:pointer;text-transform:none;letter-spacing:.02em}
+/* The update instructions open over the page rather than inside it: the stage
+   is a fixed 800x480, and a card pushed into any page overflowed its layout. */
+.updsheet{position:absolute;left:0;right:0;top:46px;bottom:0;background:rgba(0,0,0,.38);display:none;align-items:flex-start;justify-content:center;padding-top:26px;z-index:20}
+.updsheet.on{display:flex}
+.updbox{width:600px;background:var(--card);border:1px solid var(--brandgold);border-radius:12px;padding:14px 16px;box-shadow:var(--elev)}
+.updbox .lbl{margin-bottom:4px}
+.updbox p{font-size:.74rem;color:var(--muted);margin:0 0 8px;line-height:1.45}
+.updbox code{display:block;padding:8px 10px;border-radius:7px;background:var(--tert);font-size:.74rem;word-break:break-all;user-select:all}
+.updbox button{margin-top:10px;float:right;border:1px solid var(--edge2);background:transparent;color:inherit;border-radius:8px;padding:5px 14px;font-weight:700;cursor:pointer}
 .clock{font-variant-numeric:tabular-nums;color:var(--brandgold);font-weight:800;font-size:.92rem;letter-spacing:.02em}
 .tbtn{width:34px;height:34px;border-radius:9px;border:1px solid rgba(0,0,0,.18);
  background:var(--brandgold);color:#3A3417;cursor:pointer;display:flex;align-items:center;justify-content:center;
@@ -126,10 +137,22 @@ body.compact #stage{transform:none!important}
        set network-wide and arrives on a heartbeat, so a node that has not
        reported in yet says so rather than guessing. -->
   <div id="srcmode" class="pill" title="Set on the admin console, for the whole network">&mdash;</div>
+  <!-- Shown only when a newer release exists. The node never installs one by
+       itself (see update.rs), so the screen is where the person who looks
+       after it finds out. The System page carries the command to run. -->
+  <div id="updpill" class="pill upd" style="display:none" title="A newer version is available — tap for how to install it"></div>
   <div id="clock" class="clock">--:--</div>
   <button class="tbtn" id="fsbtn" title="Full screen"></button>
   <button class="tbtn" id="viewbtn" title="Toggle screen size"></button>
   <button class="tbtn" id="theme" title="Toggle theme"></button>
+</div>
+<div id="updsheet" class="updsheet" role="dialog" aria-label="Update available">
+  <div class="updbox">
+    <div class="lbl" id="updtitle">Update available</div>
+    <p>Nothing installs until someone chooses to. In a terminal on this machine, run the command below. It checks the download, replaces the program and restarts the node; the library, settings and service options stay as they are, and seeding carries on from where it was.</p>
+    <code>sermonindex-node upgrade</code>
+    <button type="button" id="updclose">Close</button>
+  </div>
 </div>
 <div class="wrap">
   <div class="page on" id="p_map"></div>
@@ -469,6 +492,12 @@ document.addEventListener('keydown',function(e){if((e.key==='F11'||e.key==='f')&
 })();
 var S={},LASTMAP='';
 function cur(){return document.querySelector('.nav button.on').dataset.p}
+document.addEventListener('click',function(e){
+  var t=e.target&&e.target.id, sh=document.getElementById('updsheet');
+  if(!sh)return;
+  if(t==='updpill')sh.classList.add('on');
+  else if(t==='updclose'||t==='updsheet')sh.classList.remove('on');
+});
 function render(){
   var n=S.node||{},sy=S.system||{},tr=S.trends||{},nw=S.network||{};
   var reach=n.peers!=null&&n.peers>0;
@@ -484,6 +513,13 @@ function render(){
   if(el){
     el.textContent = sm ? (SRCNAME[sm]||sm) : 'source: waiting for the console';
     el.className = 'pill'+(sm==='hybrid'||sm==='p2p'?' on':'');
+  }
+  var upv=n.update_available?String(n.update_available).replace(/^v/i,''):'';
+  var upel=$('#updpill');
+  if(upel){
+    if(upv){upel.style.display='flex';upel.textContent='Update v'+upv;}
+    else{upel.style.display='none';$('#updsheet').classList.remove('on');}
+    $('#updtitle').textContent='Update available \u00b7 v'+upv+(n.version?' (running v'+n.version+')':'');
   }
   $('#statustxt').textContent=(n.available===false?'STARTING':'SEEDING')+(reach?' · '+n.peers+' PEERS':' · IDLE');
   var p=cur();

@@ -15,22 +15,63 @@ use crate::state::Shared;
 /// admin flipping `seed_access.enabled = 1` makes this true, so the node shows
 /// blue on the map ONLY when the admin has set it as a seed (and it is reachable).
 pub async fn check_seed_access(client: &reqwest::Client, node_id: &str) -> bool {
+    seed_access(client, node_id).await.unwrap_or(false)
+}
+
+/// The console's answer, or None when it could not be asked (offline, server
+/// error) — so a caller can fall back to the last answer it saw instead of
+/// treating a network blip as a "no".
+pub async fn seed_access(client: &reqwest::Client, node_id: &str) -> Option<bool> {
+    seed_status(client, node_id).await.map(|s| s.enabled)
+}
+
+/// Where this machine's seed request stands on the console.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeedStatus {
+    pub enabled: bool,
+    /// "approved", "pending", "denied", "none" — or "unknown" from a console
+    /// older than the status field, which only ever said enabled or not.
+    pub status: String,
+    pub declined_at: Option<String>,
+}
+
+pub fn parse_seed_status(data: &Value) -> Option<SeedStatus> {
+    if !data.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let status = match data.get("status").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None if enabled => "approved".into(),
+        None => "unknown".into(),
+    };
+    let declined_at = data.get("declined_at").and_then(|v| v.as_str()).map(String::from);
+    Some(SeedStatus { enabled, status, declined_at })
+}
+
+pub async fn seed_status(client: &reqwest::Client, node_id: &str) -> Option<SeedStatus> {
     let url = format!("{API_BASE}/api/seed/access?node_id={node_id}");
-    let resp = match client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return false,
-    };
-    let data: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    data.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
-        && data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)
+    let resp = client.get(&url).timeout(std::time::Duration::from_secs(10)).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: Value = resp.json().await.ok()?;
+    parse_seed_status(&data)
+}
+
+#[cfg(test)]
+mod seed_status_tests {
+    use super::*;
+    #[test]
+    fn reads_new_and_old_answers() {
+        let s = parse_seed_status(&json!({"ok": true, "enabled": false, "status": "denied", "declined_at": "2026-10-02T10:00:00Z"})).unwrap();
+        assert_eq!((s.enabled, s.status.as_str()), (false, "denied"));
+        assert!(s.declined_at.is_some());
+        // A console from before the status field.
+        assert_eq!(parse_seed_status(&json!({"ok": true, "enabled": true})).unwrap().status, "approved");
+        assert_eq!(parse_seed_status(&json!({"ok": true, "enabled": false})).unwrap().status, "unknown");
+        assert!(parse_seed_status(&json!({"ok": false})).is_none());
+    }
 }
 
 /// Pull the network-wide settings the console publishes out of a heartbeat

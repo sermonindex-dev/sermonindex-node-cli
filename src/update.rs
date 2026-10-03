@@ -13,8 +13,9 @@
 //!
 //! So this module answers one question — "is there a newer release?" — and
 //! then does nothing but say so: once a day in the log, and continuously on
-//! /stats so the local dashboard can show a badge. Installing is a deliberate
-//! act: `sermonindex-node update` prints exactly what to run.
+//! /stats so the kiosk shows an "Update" pill. Installing is a deliberate act,
+//! and since 0.3.3 a one-word one: `sermonindex-node upgrade` runs the same
+//! verified installer as a fresh install, keeping the service as it was.
 //!
 //! TWO SOURCES, NEITHER REQUIRED
 //!
@@ -106,18 +107,22 @@ pub fn from_heartbeat(body: &Value) -> Option<String> {
 /// The line printed for `sermonindex-node update`, and once a day by the
 /// background check. Deliberately instructions rather than an action.
 pub fn install_hint(latest: &str) -> String {
+    // The old wording sent people to a web page to download a binary and swap
+    // it by hand, and named a `systemctl --user` unit the installer never
+    // creates (it registers a system service). Re-running the installer is the
+    // real path: it verifies the SHA-256, replaces the binary and — since
+    // 0.3.2 — restarts the service, so the new version is what's running.
     format!(
         "A newer node is available: {latest} (running {}).\n\
          \n\
          Nothing has been installed — a seed node never updates itself while it\n\
-         may be mid-upload to someone. To update, when it suits you:\n\
+         may be mid-upload to someone. To update, when it suits you, run:\n\
          \n\
-           1. Stop the node (Ctrl-C, or `systemctl --user stop sermonindex-node`)\n\
-           2. Download {latest} from https://sermonindex.net/md/node-software/\n\
-           3. Replace the binary and start it again\n\
+           sermonindex-node upgrade\n\
          \n\
-         Your library, torrents and settings in ~/.sermonindex are untouched by\n\
-         an upgrade — the node picks up exactly where it left off.",
+         It checks the download, replaces the program and restarts the node.\n\
+         Your library, torrents and settings in ~/.sermonindex are untouched —\n\
+         the node picks up exactly where it left off.",
         current()
     )
 }

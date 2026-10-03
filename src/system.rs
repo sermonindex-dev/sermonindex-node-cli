@@ -127,6 +127,12 @@ fn cpu_temp_c() -> Option<f32> {
 /// a node writing to /mnt/library does not care how much room / has. statvfs is
 /// the question actually being asked: how much can I write HERE.
 pub fn free_bytes(path: &std::path::Path) -> u64 {
+    disk_space(path).0
+}
+
+/// (free, total) bytes on the filesystem holding `path` — free as this user
+/// may write it, which is what "will it fit" means.
+pub fn disk_space(path: &std::path::Path) -> (u64, u64) {
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -137,21 +143,64 @@ pub fn free_bytes(path: &std::path::Path) -> u64 {
         while !p.exists() {
             match p.parent() {
                 Some(par) => p = par.to_path_buf(),
-                None => return 0,
+                None => return (0, 0),
             }
         }
-        let Ok(c) = CString::new(p.as_os_str().as_bytes()) else { return 0 };
+        let Ok(c) = CString::new(p.as_os_str().as_bytes()) else { return (0, 0) };
         unsafe {
             let mut st: libc::statvfs = std::mem::zeroed();
             if libc::statvfs(c.as_ptr(), &mut st) == 0 {
-                return (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+                let fr = st.f_frsize as u64;
+                return ((st.f_bavail as u64).saturating_mul(fr), (st.f_blocks as u64).saturating_mul(fr));
             }
         }
-        0
+        (0, 0)
     }
     #[cfg(not(unix))]
     {
         let _ = path;
-        0
+        (0, 0)
     }
+}
+
+/// Memory charged to the node's systemd service, split the way that matters.
+///
+/// `systemctl status` prints one "Memory:" figure, and that figure includes
+/// the kernel's disk cache for every file the node has written or read — on a
+/// node that has just downloaded 400 GB it sits at the service's ceiling and
+/// looks like a leak. It isn't: cache is handed back the moment anything else
+/// needs it. `anon` is what the program itself is using; `file` is cache.
+pub struct ServiceMemory {
+    pub anon: u64,
+    pub file: u64,
+    pub current: u64,
+    pub high: Option<u64>,
+    pub max: Option<u64>,
+}
+
+pub fn service_memory() -> Option<ServiceMemory> {
+    let base = std::path::Path::new("/sys/fs/cgroup/system.slice/sermonindex-node.service");
+    let stat = std::fs::read_to_string(base.join("memory.stat")).ok()?;
+    let (mut anon, mut file) = (0u64, 0u64);
+    for l in stat.lines() {
+        let mut it = l.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("anon"), Some(v)) => anon = v.parse().unwrap_or(0),
+            (Some("file"), Some(v)) => file = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    // "max" in these files means unlimited, which parses to None.
+    let rd = |n: &str| {
+        std::fs::read_to_string(base.join(n))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    Some(ServiceMemory {
+        anon,
+        file,
+        current: rd("memory.current").unwrap_or(anon + file),
+        high: rd("memory.high"),
+        max: rd("memory.max"),
+    })
 }

@@ -313,9 +313,14 @@ impl Seeder {
             .await
             .map_err(|e| anyhow!("add_torrent (fetch): {e:#}"))?;
 
-        let handle = match handle.into_handle() {
-            Some(h) => h,
-            None => return Ok(false),
+        // Already in the session means this file is already ours (or another
+        // fetch has it): report what it is, and never delete it on the way out.
+        let handle = match handle {
+            librqbit::AddTorrentResponse::AlreadyManaged(_, h) => return Ok(h.stats().finished),
+            other => match other.into_handle() {
+                Some(h) => h,
+                None => return Ok(false),
+            },
         };
 
         let started = std::time::Instant::now();
@@ -343,15 +348,21 @@ impl Seeder {
                 // authority on what a file should be.
                 return Ok(true);
             }
+            // Every give-up below removes the file as well as the torrent
+            // (`delete(.., true)`). The engine creates the file at full length
+            // before any data arrives, so what a failed fetch leaves behind is
+            // the right size and mostly empty — and until 0.3.4 the HTTP
+            // fallback read "right size" as "already have it" and skipped it.
+            //
             // Nobody has it. This is the common case early in the network's life
             // and it must be cheap.
             if best == 0 && started.elapsed() >= first_byte {
-                let _ = self.session.delete(handle.id().into(), false).await;
+                let _ = self.session.delete(handle.id().into(), true).await;
                 return Ok(false);
             }
             // It started and stopped. Same verdict as the HTTP watchdog.
             if best > 0 && last_progress.elapsed() >= stall {
-                let _ = self.session.delete(handle.id().into(), false).await;
+                let _ = self.session.delete(handle.id().into(), true).await;
                 return Ok(false);
             }
             // A swarm that is slower than our own CDN is not worth the slot.
@@ -361,7 +372,7 @@ impl Seeder {
                 60 + (expected_size / (32 * 1024)).min(900),
             );
             if started.elapsed() >= cap {
-                let _ = self.session.delete(handle.id().into(), false).await;
+                let _ = self.session.delete(handle.id().into(), true).await;
                 return Ok(false);
             }
         }

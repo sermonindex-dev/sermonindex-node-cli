@@ -34,6 +34,11 @@ pub const APP_VERSION: &str = concat!("cli-", env!("CARGO_PKG_VERSION"));
 /// newest first, versions carrying a leading "v".
 pub const MANIFEST_URL: &str = "https://sermonindex4.b-cdn.net/node-cli/releases/releases.json";
 
+/// The installer `sermonindex-node upgrade` runs. Same script as the one-line
+/// install: it reads the release index, verifies the SHA-256 before using any
+/// download, replaces the binary and restarts the service.
+pub const INSTALLER_URL: &str = "https://sermonindex4.b-cdn.net/node-cli/install.sh";
+
 /// How often to re-read the signed master list looking for newly published
 /// sermons. Before 0.2.2 it was read exactly once, at startup — so a node that
 /// had been up for three weeks was serving the library as it stood three weeks
@@ -123,13 +128,72 @@ pub fn node_id(settings: &mut Value) -> String {
     id
 }
 
-/// The seed scope: "audio" (~400 GB) or "full" (~2.4 TB). Defaults to audio.
+/// The seed scope: "picks", "audio" (~373 GB) or "full" (~2.4 TB).
+/// What this node holds. Unset means "picks": nothing downloads until the
+/// person chooses — speakers in the menu, or (once approved) the library.
 pub fn seed_scope(settings: &Value) -> String {
     settings
         .get("seed_scope")
         .and_then(|v| v.as_str())
-        .unwrap_or("audio")
+        .unwrap_or("picks")
         .to_string()
+}
+
+/// The last seed-access answer from the console, kept so a node that cannot
+/// reach it for a while carries on as it was rather than flipping.
+pub fn seed_access_cached(settings: &Value) -> bool {
+    settings.get("seed_access_granted").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Does this machine already hold library files? (download-state.json has
+/// entries, or the library folder has shard folders in it.)
+pub fn has_library_content(settings: &Value) -> bool {
+    let state = data_dir().join("download-state.json");
+    if std::fs::metadata(&state).map(|m| m.len() > 4).unwrap_or(false) {
+        return true;
+    }
+    std::fs::read_dir(downloads_dir(settings))
+        .map(|mut d| d.any(|e| e.map(|e| e.path().is_dir()).unwrap_or(false)))
+        .unwrap_or(false)
+}
+
+/// Decide the scope at start-up, and write it down so the menu and the
+/// service agree from then on.
+///
+///  * Saved in settings → that wins, even over the service's own `--scope`
+///    (units written before 0.3.3 all say `--scope audio`, and the menu must
+///    be able to change it). A person typing `start --scope X` at a terminal
+///    is a fresh decision: it wins and is saved.
+///  * Not saved, `--scope` given → adopt it (an existing service keeps doing
+///    what it was installed to do).
+///  * Neither → a machine that already holds library files keeps the audio
+///    library (older nodes never wrote a scope); a new one starts with picks,
+///    i.e. nothing, until someone chooses.
+pub fn settle_scope(settings: &mut Value, arg: Option<String>, interactive: bool) -> String {
+    let saved = settings.get("seed_scope").and_then(|v| v.as_str()).map(String::from);
+    let (scope, save) = match (arg, saved) {
+        (Some(a), Some(cur)) if a != cur && interactive => {
+            println!("[scope] {a} (was {cur}) — saved");
+            (a, true)
+        }
+        (Some(a), Some(cur)) if a != cur => {
+            println!(
+                "[scope] using '{cur}' from settings, not '--scope {a}' (change it in the menu or with `config scope`)"
+            );
+            (cur, false)
+        }
+        (_, Some(cur)) => (cur, false),
+        (Some(a), None) => (a, true),
+        (None, None) => {
+            let a = if has_library_content(settings) { "audio" } else { "picks" };
+            (a.to_string(), true)
+        }
+    };
+    if save {
+        settings["seed_scope"] = serde_json::json!(scope);
+        let _ = save_settings(settings);
+    }
+    scope
 }
 
 /// Whether to join the BitTorrent DHT. Defaults to TRUE.
@@ -571,6 +635,15 @@ pub fn source_mode_names(mode: &str) -> (&'static str, &'static str) {
 /// for a node on a data-centre link, which is where our most complete mirrors
 /// live — one operator running three machines in two data centres had no way to
 /// use any of that capacity.
+/// Space the node leaves free on the library's drive (default 10 GB), so a
+/// node on someone's everyday computer stops downloading before the desktop,
+/// the browser and the system updates run out of room. Settings key
+/// `keep_free_gb`; 0 lets it fill the drive (a dedicated library disk).
+pub fn keep_free_bytes(settings: &Value) -> u64 {
+    let gb = settings.get("keep_free_gb").and_then(|v| v.as_f64()).unwrap_or(10.0).max(0.0);
+    (gb * 1024.0 * 1024.0 * 1024.0) as u64
+}
+
 pub fn download_workers(settings: &Value) -> usize {
     settings
         .get("download_workers")

@@ -22,7 +22,7 @@
 //! someone believe a live node just changed scope.
 
 use anyhow::{bail, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::config;
 
@@ -35,13 +35,41 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     let mut s = config::load_settings();
+    let mut notes = Vec::new();
+    let restart_note = apply(&mut s, key, val, &mut notes)?;
+    config::save_settings(&s)?;
+    for n in &notes {
+        println!("{n}");
+    }
+    println!("Saved.");
+    if restart_note {
+        println!("Restart the node for this to take effect.");
+    }
+    show()
+}
+
+/// Validate and apply one setting to `s` without saving or printing, so the
+/// interactive menu and `config <key> <value>` share every rule. Returns
+/// whether a running node needs a restart to notice; anything worth telling
+/// the person is pushed onto `notes`.
+pub fn apply(s: &mut Value, key: &str, val: &str, notes: &mut Vec<String>) -> Result<bool> {
     let mut restart_note = true;
 
     match key {
         "scope" => {
             match val {
-                "audio" | "full" => s["seed_scope"] = json!(val),
-                _ => bail!("scope must be 'audio' (~412 GB) or 'full' (~2.4 TB)"),
+                "audio" | "full" | "picks" => {
+                    s["seed_scope"] = json!(val);
+                    if val != "picks" && !config::seed_access_cached(s) {
+                        notes.push(
+                            "Holding the whole library needs seed node approval for this machine. Until it \
+                             is approved the node downloads only your picks. Ask with: \
+                             sermonindex-node seed request --email you@example.com"
+                                .into(),
+                        );
+                    }
+                }
+                _ => bail!("scope must be 'picks' (only what you choose in the menu), 'audio' (~373 GB) or 'full' (~2.4 TB) — audio and full need seed node approval"),
             }
         }
         "dir" => {
@@ -107,17 +135,17 @@ pub fn run(args: &[String]) -> Result<()> {
         "public-port" => {
             if val == "off" || val == "0" || val == "auto" {
                 if let Some(o) = s.as_object_mut() { o.remove("public_port"); }
-                println!("Public port cleared — the node will announce whatever it binds,");
-                println!("or whatever NAT-PMP gives it.");
+                notes.push(format!("Public port cleared — the node will announce whatever it binds,"));
+                notes.push(format!("or whatever NAT-PMP gives it."));
             } else {
                 let n: u64 = val.parse().map_err(|_| anyhow::anyhow!("not a port: {val}"))?;
                 if !(1..=65535).contains(&n) {
                     bail!("port must be 1-65535");
                 }
                 s["public_port"] = json!(n);
-                println!("Peers will be told to dial port {n}.");
-                println!("This is stamped into every announce when the node starts, so it");
-                println!("takes a restart — and the node must actually be reachable there.");
+                notes.push(format!("Peers will be told to dial port {n}."));
+                notes.push(format!("This is stamped into every announce when the node starts, so it"));
+                notes.push(format!("takes a restart — and the node must actually be reachable there."));
             }
         }
         "public-ip" => {
@@ -160,8 +188,17 @@ pub fn run(args: &[String]) -> Result<()> {
             s["max_peers_per_torrent"] = json!(n);
         }
         "window" => {
-            let n: u64 = val.parse().map_err(|_| anyhow::anyhow!("not a number: {val}"))?;
-            s["active_torrents"] = json!(n);
+            if val == "auto" {
+                if let Some(o) = s.as_object_mut() {
+                    o.remove("active_torrents");
+                }
+            } else {
+                let n: u64 = val.parse().map_err(|_| anyhow::anyhow!("not a number: {val}"))?;
+                if n < 100 {
+                    bail!("use at least 100 (or 'auto')");
+                }
+                s["active_torrents"] = json!(n);
+            }
         }
         "rotate" => {
             let n: u64 = val.parse().map_err(|_| anyhow::anyhow!("not a number: {val}"))?;
@@ -169,6 +206,16 @@ pub fn run(args: &[String]) -> Result<()> {
                 bail!("rotate must be at least 1 minute");
             }
             s["rotate_minutes"] = json!(n);
+        }
+        "keep-free" => {
+            if val.is_empty() {
+                bail!("give a size such as 20GB, or 'off'");
+            }
+            if val == "off" || val == "0" {
+                s["keep_free_gb"] = json!(0);
+            } else {
+                s["keep_free_gb"] = json!(parse_size_gb(val)?);
+            }
         }
         "reset" => {
             // Only the tuning knobs. node_id, storage_dir and quiet_hours are
@@ -183,19 +230,13 @@ pub fn run(args: &[String]) -> Result<()> {
                     o.remove(k);
                 }
             }
-            println!("Tuning reset to the defaults for this machine.");
-            println!("(node id, storage folder and quiet hours were left alone.)");
+            notes.push(format!("Tuning reset to the defaults for this machine."));
+            notes.push(format!("(node id, storage folder and quiet hours were left alone.)"));
             restart_note = false;
         }
         other => bail!("unknown setting '{other}' — run `sermonindex-node config` to see them all"),
     }
-
-    config::save_settings(&s)?;
-    println!("Saved.");
-    if restart_note {
-        println!("Restart the node for this to take effect.");
-    }
-    show()
+    Ok(restart_note)
 }
 
 fn on_off(v: &str) -> Result<bool> {
@@ -287,6 +328,17 @@ fn show() -> Result<()> {
     println!("\n  Content");
     println!("    scope        {}", config::seed_scope(&s));
     println!("    dir          {}", config::downloads_dir(&s).display());
+    {
+        let dir = config::downloads_dir(&s);
+        let (free, total) = crate::system::disk_space(&dir);
+        let gb = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
+        println!(
+            "    keep-free    {:.0} GB left empty on that drive   (now {:.0} GB free of {:.0} GB)",
+            gb(config::keep_free_bytes(&s)),
+            gb(free),
+            gb(total)
+        );
+    }
     println!(
         "    source       {}{}",
         config::content_mode(&s),

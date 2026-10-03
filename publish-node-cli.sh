@@ -60,7 +60,7 @@ STAGE="$WORK/stage"; mkdir -p "$STAGE"
 SRC_NAME="sermonindex-node-$TAG.tar.gz"
 PKG="$WORK/pkg/sermonindex-node-$TAG"
 mkdir -p "$PKG"
-for item in Cargo.toml Cargo.lock README.md LICENSE install.sh build-and-install.sh \
+for item in Cargo.toml Cargo.lock README.md LICENSE install.sh build-and-install.sh setup.sh \
             src assets packaging vendor; do
   [ -e "$item" ] && cp -R "$item" "$PKG/"
 done
@@ -139,6 +139,12 @@ if [ -f install.sh ]; then
   log "Publishing the installer"
   put install.sh "node-cli/install.sh" "text/x-shellscript"
 fi
+# One-shot machine setup (sleep, blanking, swap, node, kiosk) — run as root:
+#   su -   then   wget -qO- https://sermonindex4.b-cdn.net/node-cli/setup.sh | bash
+if [ -f setup.sh ]; then
+  log "Publishing the machine setup script"
+  put setup.sh "node-cli/setup.sh" "text/x-shellscript"
+fi
 
 # ── 4. Rebuild releases.json (newest first, this version deduped in) ─────────
 # Fetched from the CDN rather than kept locally, so publishing from a different
@@ -175,7 +181,7 @@ put "$INDEX" "$PREFIX/releases.json" "application/json"
 
 # ── 5. Purge so the page sees it immediately ────────────────────────────────
 API_KEY="${BUNNY_API_KEY:-}"
-PURGE=("$CDN/$PREFIX/releases.json" "$CDN/node-cli/install.sh" "https://sermonindex.net/node-software/")
+PURGE=("$CDN/$PREFIX/releases.json" "$CDN/node-cli/install.sh" "$CDN/node-cli/setup.sh" "https://sermonindex.net/node-software/")
 if [ -n "$API_KEY" ] && [ "$DRY" = "0" ]; then
   log "Purging CDN"
   for u in "${PURGE[@]}"; do

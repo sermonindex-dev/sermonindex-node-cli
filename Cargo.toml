@@ -1,6 +1,6 @@
 [package]
 name = "sermonindex-node"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "SermonIndex headless seed node — download, hold, and seed the sermon archive with an optional built-in dashboard."
 authors = ["SermonIndex"]
@@ -32,6 +32,12 @@ sysinfo = "0.32"
 crab_nat = "0.2"
 futures-util = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# The interactive menu (`sermonindex-node menu`). crossterm comes re-exported
+# through ratatui, so the two can never disagree on a version. Pure Rust, no
+# terminfo or ncurses — the static musl build stays static.
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+# posix_fadvise, to drop finished downloads from the page cache (download.rs).
+libc = "0.2"
 
 # BitTorrent engine — same one the desktop app uses (optional, feature "seed").
 librqbit = { version = "9.0.0-rc.0", optional = true }

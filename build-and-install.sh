@@ -9,10 +9,15 @@
 set -euo pipefail
 log(){ printf '\n\033[1;33m== %s ==\033[0m\n' "$*"; }
 
-USER_NAME="$(id -un)"
-HOME_DIR="$HOME"
+USER_NAME="${NODE_USER:-$(id -un)}"
+HOME_DIR="$(getent passwd "$USER_NAME" 2>/dev/null | cut -d: -f6 || true)"
+HOME_DIR="${HOME_DIR:-$HOME}"
+# Whether service options were GIVEN (install.sh passes its own reading, since
+# by then it has already defaulted SCOPE). With none given and a service
+# already installed, this is an upgrade: the service is kept as it is.
+SERVICE_OPTS_GIVEN="${SERVICE_OPTS_GIVEN-${SCOPE:-}${STORAGE:-}${MEM_HIGH:-}${MEM_MAX:-}}"
 STORAGE="${STORAGE:-}"
-SCOPE="${SCOPE:-audio}"
+SCOPE="${SCOPE:-}"
 # Honour PREFIX so `PREFIX=$HOME/.local` from install.sh actually lands there
 # instead of silently installing to /usr/local.
 PREFIX="${PREFIX:-/usr/local}"
@@ -115,7 +120,17 @@ MEM_MAX="${MEM_MAX:-$(( RAM_MB > 3000 ? RAM_MB - 1000 : RAM_MB * 70 / 100 ))}M"
 log "Memory ceiling for the service: high=${MEM_HIGH} max=${MEM_MAX} (of ${RAM_MB}M total)"
 
 UNIT=/etc/systemd/system/sermonindex-node.service
-EXEC="$PREFIX/bin/sermonindex-node start --scope ${SCOPE}"
+if [ -f "$UNIT" ] && [ -z "$SERVICE_OPTS_GIVEN" ]; then
+  # UPGRADE: keep the existing service (its user, scope, library folder and any
+  # lines added by hand) and restart it onto the new program. See the same
+  # branch in install.sh for what rewriting it used to break.
+  log "Keeping the existing service and restarting it on the new version"
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl restart sermonindex-node.service
+  KEPT_SERVICE=1
+else
+EXEC="$PREFIX/bin/sermonindex-node start"
+[ -n "$SCOPE" ] && EXEC="$EXEC --scope ${SCOPE}"
 [ -n "$STORAGE" ] && EXEC="$EXEC --dir ${STORAGE}"
 $SUDO tee "$UNIT" >/dev/null <<EOF
 [Unit]
@@ -163,7 +178,11 @@ WantedBy=multi-user.target
 EOF
 
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now sermonindex-node.service
+# enable, then restart: `enable --now` leaves an already-running service on the
+# old program until the next reboot.
+$SUDO systemctl enable sermonindex-node.service
+$SUDO systemctl restart sermonindex-node.service
+fi
 sleep 2
 
 # ── Optional: touchscreen / monitor display ─────────────────────────────────
@@ -211,6 +230,13 @@ X-GNOME-Autostart-enabled=true
 DESKTOPEOF
   # Remove any earlier cog-based entry so two browsers can't both launch.
   rm -f "$HOME_DIR/.config/autostart/si-cog-kiosk.desktop" 2>/dev/null
+  # Run as root (su -), these were just created root-owned in the user's home;
+  # the desktop session couldn't then run or replace them.
+  if [ "$(id -u)" = "0" ] && [ -n "${USER_NAME:-}" ] && [ "$USER_NAME" != "root" ]; then
+    chown "$USER_NAME": "$HOME_DIR/.local" "$HOME_DIR/.local/bin" "$HOME_DIR/.config" \
+      "$HOME_DIR/.config/autostart" "$HOME_DIR/.local/bin/si-kiosk.sh" \
+      "$HOME_DIR/.config/autostart/si-node-display.desktop" 2>/dev/null || true
+  fi
   echo "  display installed — starts on boot, or now with:"
   echo "    nohup setsid $HOME_DIR/.local/bin/si-kiosk.sh >/tmp/kiosk.log 2>&1 &"
 fi
@@ -225,7 +251,13 @@ The node is running as a service and will start on every boot.
   dashboard:  http://localhost:8137/   (open in a browser, or point a kiosk at it)
   node info:  sermonindex-node status
 
-It is downloading the ${SCOPE} library now, seeding what it holds, and it will
-appear on the live node map within a few minutes. Forward TCP 42800 for the best
-peer reachability.
 EOF
+if [ -n "${KEPT_SERVICE:-}" ]; then
+  echo "Upgraded and restarted with its existing settings. It carries on seeding"
+  echo "from where it was."
+else
+  echo "It is running and will appear on the live node map within a few minutes."
+  echo "Nothing downloads until you choose: type  sermonindex-node  to open the menu,"
+  echo "then pick speakers, or ask to be a seed node (the whole library — needs approval)."
+  echo "Forward TCP 42800 for the best peer reachability."
+fi

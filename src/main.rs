@@ -11,9 +11,13 @@ mod download;
 mod heartbeat;
 mod masterlist;
 mod net;
+mod nodelog;
 mod state;
 mod system;
 mod cfg;
+mod catalog;
+mod menu;
+mod picks;
 mod natpmp;
 mod peercheck;
 mod update;
@@ -30,8 +34,18 @@ use state::Shared;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("start");
+    // Bare `sermonindex-node` typed at a terminal opens the menu: that is a
+    // person, and a person is better served by a menu than by a node that
+    // starts streaming log lines at them. Anything without a terminal — the
+    // systemd unit, a script, a NAS task — still gets `start`, as it always
+    // has (the unit names `start` explicitly anyway).
+    let default_cmd = {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() { "menu" } else { "start" }
+    };
+    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or(default_cmd);
     match cmd {
+        "menu" => menu::run(),
         "version" | "-V" | "--version" => {
             println!("sermonindex-node {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -56,6 +70,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             rt.block_on(run_update())
         }
+        "upgrade" => run_upgrade(),
         "quiet" => run_quiet(&args),
         "verify" => {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -64,10 +79,23 @@ fn main() -> Result<()> {
             rt.block_on(run_verify(&args))
         }
         "start" | "run" => {
+            // Keep a copy of everything the node prints in ~/.sermonindex/node.log,
+            // which is what the menu's activity panel shows.
+            nodelog::install();
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_daemon(&args))
+            let r = rt.block_on(run_daemon(&args));
+            if let Err(e) = &r {
+                // Printed here (one line, into node.log) rather than by
+                // returning it, which would print it a second time after the
+                // log is closed.
+                eprintln!("Error: {e:#}");
+                nodelog::finish();
+                std::process::exit(1);
+            }
+            nodelog::finish();
+            r
         }
         other => {
             eprintln!("unknown command: {other}\n");
@@ -102,15 +130,16 @@ COMMANDS
                  quiet add sun,wed 08:00-13:00  several days at once
                  quiet remove 2                 delete window 2 from the list
                  quiet clear                    remove all quiet hours
-  seed         Full-archive (video) access is granted per machine by a person.
-               Audio scope needs no approval and is always available.
+  seed         Seed node access: holding the whole library (audio, or audio and
+               video) is approved per machine on the SermonIndex console.
+               Picking speakers needs no approval.
                  seed request --email you@example.com
                  seed status
   config       View or change any setting — the same controls the desktop app
                has, from the terminal. Writes settings.json atomically, so the
                app and the node can both edit it safely.
                  config                         show everything
-                 config scope full              audio (~412 GB) | full (~2.4 TB)
+                 config scope picks             picks (default) | audio | full
                  config dir /mnt/library        where the library lives
                  config upload 2000             KB/s, or "off" for unlimited
                  config monthly-cap 500GB       total upload per month, or "off"
@@ -142,20 +171,28 @@ COMMANDS
                the hourly pass, and retry anything that failed earlier. Safe to
                run any time — the missing set is recomputed from what is on
                disk, so nothing is fetched twice. (also: sweep)
+  menu         The interactive menu: browse speakers and download all of one
+               preacher, pick what this node holds, change settings, update.
+               (Also what plain `sermonindex-node` opens in a terminal.)
   update       Check whether a newer node has been released. Never installs
                anything on its own — a seed node mid-upload does not restart
                itself because a version number changed.
+  upgrade      Install the newest release now, when you choose to: verifies
+               the download, replaces the program, restarts the service. Your
+               library, settings and service options are kept.
   verify       Audit the library against the signed master list (presence +
                exact size for every file) and report coverage. Read-only.
   version      Print the version.
   help         Show this help (also: -h, --help).
 
 START OPTIONS
-  --scope <audio|full>   What to hold and seed. "full" requires approval —
-                         run `seed request` first; an unapproved node starts in
-                         audio scope rather than refusing to run.
-                           audio   ~400 GB  — every audio sermon (default)
-                           full    ~2.4 TB  — audio + video, a complete backup
+  --scope <picks|audio|full>   What to hold and seed (saved to settings; the menu's
+                         choice wins from then on).
+                           picks   only the speakers you choose (default)
+                           audio   ~373 GB  — every audio sermon    (seed node:
+                           full    ~2.4 TB  — audio + video          needs approval)
+                         An unapproved node downloads only its picks and keeps
+                         sharing what it already holds.
                          Falls back to settings.json "seed_scope", else audio.
   --dir <path>           Library storage directory (overrides settings.json
                          "storage_dir"). Point at a big drive, e.g. --dir /mnt/library.
@@ -244,7 +281,7 @@ SERVICE   (Linux, after build-and-install.sh)
 EXAMPLES
   sermonindex-node start
   sermonindex-node start --dir /mnt/library
-  sermonindex-node seed request --email you@example.com   # then --scope full
+  sermonindex-node seed request --email you@example.com   # then config scope audio
   sermonindex-node start --no-download          # seed-only mirror
   sermonindex-node start --port 42800           # pin the port for a router rule
   sermonindex-node refresh                      # fetch new files + retry failures now
@@ -396,6 +433,18 @@ fn run_status() -> Result<()> {
         }
     );
     println!("  dashboard:  http://localhost:{}/", config::DASHBOARD_PORT);
+    // The figure `systemctl status` prints includes disk cache, which on a node
+    // that has just written hundreds of GB sits at the service's ceiling and
+    // reads like a leak. Split it.
+    if let Some(m) = system::service_memory() {
+        let cap = m.max.or(m.high).map(|c| format!(" of a {} limit", human_bytes(c))).unwrap_or_default();
+        println!(
+            "  memory:     {} used by the node, plus {} disk cache{cap}",
+            human_bytes(m.anon),
+            human_bytes(m.file)
+        );
+        println!("              (disk cache is given back whenever anything else needs memory)");
+    }
     println!("  quiet:      {}", config::describe_quiet(&settings));
     if let Some(why) = config::quiet_now(&settings) {
         println!("              QUIET RIGHT NOW — {why}");
@@ -544,11 +593,125 @@ fn day_label(secs: u64) -> String {
 /// route on the dashboard: the daemon may be running as another user or under
 /// systemd, the dashboard port is deliberately unauthenticated, and a zero-byte
 /// file in the data dir needs no privileges, no protocol and no new surface.
-fn refresh_flag() -> std::path::PathBuf {
+fn fmt_gb(b: u64) -> String {
+    format!("{:.0} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+pub(crate) fn refresh_flag() -> std::path::PathBuf {
     config::data_dir().join("refresh-now")
 }
 
 /// Sleep up to `secs`, returning early when someone asks for a sweep.
+/// One attempt at one file from the swarm. True only when the whole file is on
+/// disk at the size the signed list says — the swarm is not the authority.
+#[cfg(feature = "seed")]
+async fn swarm_try(sd: &seed::Seeder, e: &masterlist::Entry, dest: &std::path::Path, first_byte: u64) -> bool {
+    if e.magnet.is_empty() {
+        return false;
+    }
+    let Some(parent) = dest.parent() else { return false };
+    match sd
+        .fetch_file(&e.magnet, parent, e.size, Duration::from_secs(first_byte), Duration::from_secs(60))
+        .await
+    {
+        Ok(true) => download::file_ok(dest, e.size),
+        Ok(false) => false,
+        Err(err) => {
+            eprintln!("[p2p] {}: {err:#}", e.name);
+            false
+        }
+    }
+}
+
+/// Every source there is for one file, for the retry sweep.
+///
+/// The console's content mode decides the ORDER: P2P Primary asks peers
+/// first, Archive.org + CDN asks the HTTP mirrors first. What it no longer
+/// decides is whether a source is tried at all once the others have failed.
+/// A file both mirrors refused is still worth asking the swarm for — a peer
+/// that has it is better than no file — so after HTTP fails the swarm gets a
+/// longer, last-resort chance whatever the mode. P2P Only stays peers only:
+/// that operator asked for exactly that.
+///
+/// Returns the outcome and whether the bytes came from a peer.
+#[cfg(feature = "seed")]
+async fn fetch_any(
+    cl: &reqwest::Client,
+    sd: Option<&seed::Seeder>,
+    mode: &str,
+    e: &masterlist::Entry,
+    dest: &std::path::Path,
+    urls: &[String],
+) -> (Result<download::Outcome>, bool) {
+    // The swarm writes a full-length file up front, so ask before it starts.
+    if !download::room_for(dest, e.size) && !download::looks_complete_path(dest, e.size) {
+        return (Ok(download::Outcome::NoSpace), false);
+    }
+    let swarm_first = mode == "p2p" || mode == "hybrid";
+    if let (true, Some(sd)) = (swarm_first, sd) {
+        if swarm_try(sd, e, dest, 25).await {
+            return (Ok(download::Outcome::Downloaded), true);
+        }
+    }
+    if mode == "p2p" {
+        return (Ok(download::Outcome::Failed), false);
+    }
+    let http = if urls.is_empty() {
+        Ok(download::Outcome::Failed)
+    } else {
+        download::ensure_file(cl, urls, dest, e.size).await
+    };
+    match http {
+        Ok(download::Outcome::Failed) | Err(_) => {
+            if let Some(sd) = sd {
+                if swarm_try(sd, e, dest, 90).await {
+                    return (Ok(download::Outcome::Downloaded), true);
+                }
+            }
+            (http, false)
+        }
+        other => (other, false),
+    }
+}
+
+/// What this node should hold: the scope's set, plus anything picked in the
+/// menu (picks.rs). The `picks` scope holds the picks and nothing else — the
+/// option for an old laptop that wants a few preachers, not a library.
+fn select_entries<'a>(ml: &'a masterlist::MasterList, scope: &str) -> Vec<&'a masterlist::Entry> {
+    let extra = picks::wanted_now();
+    ml.entries
+        .iter()
+        .filter(|(id, e)| {
+            let base = match scope {
+                "full" => e.is_audio() || e.is_video(),
+                "picks" => false,
+                _ => e.is_audio(),
+            };
+            base || extra.contains(id.as_str())
+        })
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// `select_entries`, and when the node is not (yet) approved as a seed node,
+/// only what it may download — the picks — plus the library files it already
+/// holds, which it keeps sharing.
+fn select_for<'a>(
+    ml: &'a masterlist::MasterList,
+    scope: &str,
+    gated: bool,
+    settings: &Value,
+) -> Vec<&'a masterlist::Entry> {
+    let all = select_entries(ml, scope);
+    if !gated {
+        return all;
+    }
+    let picked = picks::wanted_now();
+    all.into_iter()
+        .filter(|e| picked.contains(e.id()) || download::file_ok(&config::file_path(settings, &e.name), e.size))
+        .collect()
+}
+
 async fn wait_or_refresh(secs: u64) {
     let flag = refresh_flag();
     let mut left = secs;
@@ -691,6 +854,67 @@ async fn run_update() -> Result<()> {
     Ok(())
 }
 
+/// `sermonindex-node upgrade` — the deliberate, one-word way to install an
+/// update that the log, `status` and the kiosk have already announced.
+///
+/// It is the installer, run for you: nothing new about what gets trusted or
+/// how. The script verifies the SHA-256 from the release manifest before it
+/// uses a single downloaded byte, and since 0.3.3 it keeps the existing service
+/// definition (user, scope, library folder, any options added by hand) and
+/// restarts it. It runs in this terminal, so sudo can ask for a password when
+/// the program lives somewhere this user cannot write.
+fn run_upgrade() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let client = reqwest::Client::builder()
+        .user_agent(format!("sermonindex-node/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let Some(latest) = rt.block_on(update::check(&client)) else {
+        println!(
+            "Running {}, which is the newest release (or the release list could not be reached).\nNothing to do.",
+            update::current()
+        );
+        return Ok(());
+    };
+    println!("Updating {} -> {latest}\n", update::current());
+
+    // Install where this copy lives (/usr/local/bin -> PREFIX=/usr/local,
+    // ~/.local/bin -> ~/.local), so an upgrade never leaves a second copy
+    // somewhere else while the service keeps starting the old one.
+    let exe = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let prefix = exe
+        .as_deref()
+        .and_then(|p| p.parent())
+        .and_then(|bin| bin.parent())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/usr/local".to_string());
+    let has_service = std::path::Path::new("/etc/systemd/system/sermonindex-node.service").exists();
+
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!("set -o pipefail; curl -fsSL {} | bash", config::INSTALLER_URL))
+        .env("PREFIX", &prefix);
+    if !has_service {
+        // Installed without a service (run by hand, tmux, a NAS task…): do not
+        // invent one during an upgrade.
+        cmd.env("NO_SERVICE", "1");
+    }
+    let status = cmd.status()?;
+    if !status.success() {
+        bail!(
+            "the installer stopped before finishing ({status}). Read the lines above — \
+             it never installs anything it could not verify, so the node you have is unchanged \
+             unless it said otherwise."
+        );
+    }
+    if !has_service {
+        println!(
+            "\nInstalled {latest}. This node is not run by a system service, so restart it the\n\
+             way you normally start it to switch to the new version."
+        );
+    }
+    Ok(())
+}
+
 /// Human-readable byte size (GiB/MiB) for reports.
 fn human_bytes(b: u64) -> String {
     const GB: f64 = 1_073_741_824.0;
@@ -726,24 +950,20 @@ async fn run_verify(args: &[String]) -> Result<()> {
         ml.entries.len()
     );
 
-    let want_audio = scope != "full";
-    let entries: Vec<&masterlist::Entry> = ml
-        .entries
-        .values()
-        .filter(|e| if want_audio { e.is_audio() } else { e.is_audio() || e.is_video() })
-        .collect();
+    let entries: Vec<&masterlist::Entry> = select_entries(&ml, &scope);
     let total = entries.len() as u64;
 
+    download::probe_allocation(&config::downloads_dir(&settings));
     let (mut present, mut missing, mut wrong, mut have_bytes, mut want_bytes) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for e in &entries {
         want_bytes += e.size;
         let p = config::file_path(&settings, &e.name);
         match std::fs::metadata(&p) {
-            Ok(m) if m.len() == e.size => {
+            Ok(m) if download::looks_complete(&m, e.size) => {
                 present += 1;
                 have_bytes += e.size;
             }
-            Ok(_) => wrong += 1, // present but wrong size → corrupt/partial
+            Ok(_) => wrong += 1, // wrong size, or right size but hollow → corrupt/partial
             Err(_) => missing += 1,
         }
     }
@@ -813,12 +1033,19 @@ async fn run_seed(args: &[String]) -> Result<()> {
             match heartbeat::request_seed_access(&client, &node_id, &email).await {
                 Some((true, _)) => {
                     println!("[seed] already approved — this node has full-archive access.");
-                    println!("[seed] start it with:  sermonindex-node start --scope full");
+                    println!("[seed] choose what to hold:  sermonindex-node config scope audio   (or full)");
                 }
                 Some((_, _)) => {
+                    let mut s = config::load_settings();
+                    s["seed_request_email"] = serde_json::json!(email);
+                    s["seed_requested_at"] = serde_json::json!(std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0));
+                    let _ = config::save_settings(&s);
                     println!("[seed] request sent. A person reviews each one.");
                     println!("[seed] check with:  sermonindex-node seed status");
-                    println!("[seed] once approved, `--scope full` works with no reinstall.");
+                    println!("[seed] once approved, a running node starts on its own — no restart.");
                 }
                 None => {
                     bail!(
@@ -831,14 +1058,31 @@ async fn run_seed(args: &[String]) -> Result<()> {
         }
         "status" | "check" => {
             println!("[seed] node {node_id}");
-            if heartbeat::check_seed_access(&client, &node_id).await {
-                println!("[seed] GRANTED — `--scope full` is available on this machine.");
+            let st = heartbeat::seed_status(&client, &node_id).await;
+            let g = st.as_ref().map(|s| s.enabled).unwrap_or(false);
+            if st.is_some() {
+                settings["seed_access_granted"] = serde_json::json!(g);
+                let _ = config::save_settings(&settings);
+            }
+            if st.as_ref().map(|s| s.status == "denied").unwrap_or(false) {
+                println!("[seed] DECLINED — the request for this machine was not approved.");
+                println!(
+                    "[seed] ask again with:  sermonindex-node seed request --email you@example.com"
+                );
+                println!(
+                    "[seed] or write to {} with this node id.",
+                    config::SEED_CONTACT_EMAIL
+                );
+                return Ok(());
+            }
+            if g {
+                println!("[seed] GRANTED — this machine may hold the whole library (config scope audio | full).");
             } else {
                 println!("[seed] not granted.");
                 println!(
                     "[seed] ask for it with:  sermonindex-node seed request --email you@example.com"
                 );
-                println!("[seed] audio scope (~412 GB) needs no approval and works now.");
+                println!("[seed] picking speakers in the menu needs no approval and works now.");
             }
         }
         other => bail!(
@@ -855,7 +1099,11 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         settings["storage_dir"] = serde_json::json!(dir);
         let _ = config::save_settings(&settings);
     }
-    let requested_scope = arg_value(args, "--scope").unwrap_or_else(|| config::seed_scope(&settings));
+    let requested_scope = {
+        use std::io::IsTerminal;
+        let r = config::settle_scope(&mut settings, arg_value(args, "--scope"), std::io::stdin().is_terminal());
+        if matches!(r.as_str(), "picks" | "audio" | "full") { r } else { "picks".to_string() }
+    };
     let no_download = args.iter().any(|a| a == "--no-download");
     let no_dashboard = args.iter().any(|a| a == "--no-dashboard");
     let no_heartbeat =
@@ -903,55 +1151,65 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     #[cfg(not(feature = "seed"))]
     let _ = preferred_port;
 
-    // ── seed-access gate (0.2.8) ────────────────────────────────────────────
+    // ── seed-access gate ────────────────────────────────────────────────────
     //
-    // Full scope means video: ~2.4 TB and a real share of our egress bill. The
-    // desktop app has always required a per-machine approval before showing
-    // anyone the full-archive controls; the CLI did not, and the public
-    // /node-software/ page printed the full-scope command verbatim. This closes
-    // that, using the same backend the app uses — no second mechanism.
+    // Holding the LIBRARY — every audio sermon (~373 GB) or everything with
+    // video (~2.4 TB) — is a seed node, and it pulls that much from our
+    // servers. Like the desktop app's Seed Node page, it needs a per-machine
+    // approval from the console first. (Until 0.3.3 only "full" was gated;
+    // audio downloaded for anyone who ran the installer.) Picking speakers in
+    // the menu needs no approval.
     //
-    // It DOWNGRADES rather than refuses. A node that was running full scope
-    // before this release keeps every file it already holds and carries on
-    // seeding them; it simply stops fetching new video until it is approved.
-    // Refusing to start would take a working mirror offline to enforce a policy
-    // about what it downloads NEXT, which is the wrong trade in every case.
+    // Without approval the node does not refuse to start, and nothing it
+    // already holds stops being shared: it keeps seeding every library file on
+    // disk and downloads only the picks. The sweep asks the console again each
+    // round, so an approval takes effect on its own, without a restart.
     //
-    // Audio scope is never gated. The audio archive is the thing we most want
-    // copied into as many hands as possible.
-    let mut scope = requested_scope.clone();
-    let mut full_pending = false;
-    if requested_scope == "full" && !no_heartbeat {
+    // The console's last answer is kept in settings: a node that cannot reach
+    // it for a while carries on as it was, rather than flipping on a blip.
+    let scope = requested_scope.clone();
+    let mut gated = false;
+    if scope == "audio" || scope == "full" {
         let probe = reqwest::Client::builder()
             .user_agent(format!("sermonindex-node/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .ok();
-        let granted = match &probe {
-            Some(c) => heartbeat::check_seed_access(c, &node_id).await,
-            // Cannot reach the service — do NOT downgrade. An access check that
-            // fails open on a network blip is a nuisance; one that fails closed
-            // silently turns a trusted seed into an audio node the next time
-            // the admin API hiccups, and nobody would know why.
-            None => true,
+        let answer = match &probe {
+            Some(c) => heartbeat::seed_access(c, &node_id).await,
+            None => None,
+        };
+        let granted = match answer {
+            Some(g) => {
+                if settings.get("seed_access_granted").and_then(|v| v.as_bool()) != Some(g) {
+                    settings["seed_access_granted"] = serde_json::json!(g);
+                    let _ = config::save_settings(&settings);
+                }
+                g
+            }
+            None => config::seed_access_cached(&settings),
         };
         if !granted {
-            scope = "audio".to_string();
-            full_pending = true;
+            gated = true;
             println!(
-                "\n[seed] Full-archive scope needs per-machine approval, and this node\n\
-                 [seed] does not have it yet. Starting in AUDIO scope (~412 GB) instead —\n\
-                 [seed] everything already downloaded stays on disk and keeps seeding.\n\
+                "\n[seed] Holding the whole {} library makes this a seed node, which needs\n\
+                 [seed] approval for this machine first. Until then it downloads only your\n\
+                 [seed] picks, and keeps sharing every library file it already has.\n\
                  [seed]\n\
+                 [seed]   Ask in the menu (Seed node), or:\n\
                  [seed]   sermonindex-node seed request --email you@example.com\n\
                  [seed]\n\
                  [seed] node id: {node_id}\n\
-                 [seed] Once approved it switches itself to full scope on the next\n\
-                 [seed] hourly sweep — no restart, no reinstall.\n"
+                 [seed] Once approved it starts on its own — no restart needed.\n",
+                if scope == "full" { "audio and video" } else { "audio" }
             );
         }
     }
 
-    println!("SermonIndex node {} — scope={scope}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "SermonIndex node {} — scope={scope}{}",
+        env!("CARGO_PKG_VERSION"),
+        if gated { " (not approved yet — downloading picks only)" } else { "" }
+    );
     // Say what this node will actually DO for content, not just what scope it
     // holds. The desktop app puts its mode in a badge in the title bar; the CLI
     // had nowhere at all that named it, so an operator asking "is my node using
@@ -1177,13 +1435,8 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     // ── master list ──────────────────────────────────────────────────────────
     let ml = masterlist::fetch_verified(&client).await?;
     println!("[masterlist] verified v{} — {} entries", ml.version, ml.entries.len());
-    let want_audio = scope != "full";
-    let entries: Vec<masterlist::Entry> = ml
-        .entries
-        .values()
-        .filter(|e| if want_audio { e.is_audio() } else { e.is_audio() || e.is_video() })
-        .cloned()
-        .collect();
+    let entries: Vec<masterlist::Entry> =
+        select_for(&ml, &scope, gated, &settings).into_iter().cloned().collect();
     shared.total.store(entries.len() as u64, Ordering::Relaxed);
     println!("[scope] {} files in scope", entries.len());
 
@@ -1358,6 +1611,21 @@ async fn run_daemon(args: &[String]) -> Result<()> {
 
     let torrents_dir = config::torrents_dir();
     let _ = &torrents_dir; // used only under the "seed" feature
+    // Can this filesystem tell a hollow file from a whole one? (download.rs)
+    download::probe_allocation(&config::downloads_dir(&settings));
+    // Leave room on the drive for the rest of the computer (config keep-free).
+    download::set_keep_free(config::keep_free_bytes(&settings));
+    {
+        let (free, total) = system::disk_space(&config::downloads_dir(&settings));
+        if total > 0 {
+            println!(
+                "  disk    {} free of {} — downloads pause with {} left",
+                fmt_gb(free),
+                fmt_gb(total),
+                fmt_gb(download::keep_free())
+            );
+        }
+    }
     let mut dl_state = state::load_download_state();
     // (path, master-list info_hash) — the hash lets seed_file reuse its cached
     // .torrent instead of re-hashing the whole file on every startup.
@@ -1366,7 +1634,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     let mut present_bytes = 0u64;
     for e in &entries {
         let p = config::file_path(&settings, &e.name);
-        if std::fs::metadata(&p).map(|m| m.len() == e.size).unwrap_or(false) {
+        if download::file_ok(&p, e.size) {
             present += 1;
             present_bytes += e.size;
             shared.held.store(present, Ordering::Relaxed); // report immediately while scanning
@@ -1595,7 +1863,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
             .iter()
             .filter(|e| {
                 let p = storage_root.join(config::shard_for(&e.name)).join(&e.name);
-                !std::fs::metadata(&p).map(|m| m.len() == e.size).unwrap_or(false)
+                !download::file_ok(&p, e.size)
             })
             .cloned()
             .collect();
@@ -1727,9 +1995,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                                             // be. Trusting the swarm on size
                                             // would let a bad torrent define
                                             // correctness.
-                                            got_from_swarm = std::fs::metadata(&dest)
-                                                .map(|m| m.len() == e.size)
-                                                .unwrap_or(false);
+                                            got_from_swarm = download::file_ok(&dest, e.size);
                                         }
                                         Ok(false) => {}
                                         Err(err) => {
@@ -1782,9 +2048,11 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                         // reason to stop serving.
                         if !shared.disk_full.swap(true, Ordering::Relaxed) {
                             eprintln!(
-                                "\n[disk] The drive is FULL. Downloading has stopped; seeding continues.\n\
-                                 [disk] Free some space, or point the node at a bigger drive with:\n\
-                                 [disk]   sermonindex-node config dir /path/to/bigger/drive\n"
+                                "\n[disk] Downloading has stopped: the drive is full, or down to the {} \
+                                 the node keeps free for this computer. Seeding continues.\n\
+                                 [disk] Free some space, choose a bigger drive (config dir /path), or change the \
+                                 space kept free (config keep-free 5GB).\n",
+                                fmt_gb(download::keep_free())
                             );
                         }
                         return;
@@ -1905,7 +2173,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                 for (name, size) in &entries_v {
                     let p = config::file_path(&settings_v, name);
                     match std::fs::metadata(&p) {
-                        Ok(m) if m.len() == *size => ok += 1,
+                        Ok(m) if download::looks_complete(&m, *size) => ok += 1,
                         Ok(_) => wrong += 1,
                         Err(_) => missing += 1,
                     }
@@ -1963,13 +2231,13 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         let cl = client.clone();
         let sh = shared.clone();
         let settings_r = settings.clone();
-        let mut scope_r = scope.clone();
+        let scope_r = scope.clone();
         // Set when the operator asked for full scope and did not have access at
         // startup. The sweep re-checks once an hour, so an approval granted
         // while the node is running takes effect on its own — the operator does
         // not have to be told to restart, and more to the point does not have
         // to be WATCHING to know it happened.
-        let mut awaiting_seed_grant = full_pending;
+        let mut awaiting_seed_grant = gated;
         let node_id_r = node_id.clone();
         #[cfg(feature = "seed")]
         let torrents_dir_r = torrents_dir.clone();
@@ -1978,24 +2246,43 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         let mut known_version = ml.version;
         sh.masterlist_version.store(known_version, Ordering::Relaxed);
         tokio::spawn(async move {
+            // PERSISTENT RETRY. Until 0.3.4 a file that failed the opening pass
+            // waited a full hour for its next try, and that try was HTTP only
+            // and one file at a time — a node caught by an Archive.org outage
+            // could sit at 97% for days. Now: while anything is missing, come
+            // back in 2 minutes, and stretch the wait only while nothing is
+            // landing (2 → 5 → 15 → 30 → 60 minutes). Any progress resets it.
+            // Each round leads with the other HTTP mirror and asks the swarm as
+            // well (see fetch_any), so every source gets its turn. Nothing is
+            // ever given up on: the longest wait is the hour the sweep always
+            // had.
+            let incomplete =
+                sh.held.load(Ordering::Relaxed) < sh.total.load(Ordering::Relaxed);
+            let mut next_wait: u64 = if incomplete { 120 } else { config::MASTERLIST_REFRESH_SECS };
+            let mut idle_rounds: u32 = 0;
+            let mut round: u64 = 0;
             loop {
                 // Sleep in one-minute slices rather than one long hour, so
                 // `sermonindex-node refresh` can cut the wait short. The sweep
                 // is idempotent — it recomputes what is missing from what is on
                 // disk — so running it early costs nothing but a list fetch.
-                wait_or_refresh(config::MASTERLIST_REFRESH_SECS).await;
+                wait_or_refresh(next_wait).await;
+                next_wait = config::MASTERLIST_REFRESH_SECS;
                 if sh.quiet.load(Ordering::Relaxed) {
                     continue;
                 }
                 // Was this node approved for full scope while it was running?
                 // One cheap GET an hour, and only while a request is actually
                 // outstanding — a node that never asked never calls this.
-                if awaiting_seed_grant && heartbeat::check_seed_access(&cl, &node_id_r).await {
+                if awaiting_seed_grant && heartbeat::seed_access(&cl, &node_id_r).await == Some(true) {
                     awaiting_seed_grant = false;
-                    scope_r = "full".to_string();
+                    let mut s = config::load_settings();
+                    s["seed_access_granted"] = serde_json::json!(true);
+                    let _ = config::save_settings(&s);
                     println!(
-                        "[seed] approved — switching to FULL scope. Video files will start\n\
-                         [seed] arriving on this sweep. Nothing already held is affected."
+                        "[seed] APPROVED — this is now a seed node. The whole {} library starts\n\
+                         [seed] arriving on this sweep.",
+                        if scope_r == "full" { "audio and video" } else { "audio" }
                     );
                 }
                 // A full disk clears itself only by someone acting. Re-check
@@ -2003,7 +2290,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                 // freed space, and nothing else would notice.
                 if sh.disk_full.load(Ordering::Relaxed) {
                     let free = system::free_bytes(&config::downloads_dir(&settings_r));
-                    if free > 2 * 1024 * 1024 * 1024 {
+                    if free > download::keep_free() + 2 * 1024 * 1024 * 1024 {
                         sh.disk_full.store(false, Ordering::Relaxed);
                         println!("[disk] space is available again — resuming downloads");
                     } else {
@@ -2020,11 +2307,10 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                         continue;
                     }
                 };
-                let want_audio = scope_r != "full";
-                let all: Vec<masterlist::Entry> = fresh
-                    .entries
-                    .values()
-                    .filter(|e| if want_audio { e.is_audio() } else { e.is_audio() || e.is_video() })
+                // Re-reads picks.json every sweep, so speakers chosen in the
+                // menu start arriving within a minute of `refresh`.
+                let all: Vec<masterlist::Entry> = select_for(&fresh, &scope_r, awaiting_seed_grant, &settings_r)
+                    .into_iter()
                     .cloned()
                     .collect();
                 sh.total.store(all.len() as u64, Ordering::Relaxed);
@@ -2042,7 +2328,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     .iter()
                     .filter(|e| {
                         let p = config::file_path(&settings_r, &e.name);
-                        !std::fs::metadata(&p).map(|m| m.len() == e.size).unwrap_or(false)
+                        !download::file_ok(&p, e.size)
                     })
                     .cloned()
                     .collect();
@@ -2062,22 +2348,50 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                 // crawling source here could eat the entire hour between
                 // sweeps and the node would fall further behind every pass.
                 let prefer_archive_r = config::prefer_archive(&settings_r, &scope_r);
+                // Alternate which mirror leads on each retry round, so a source
+                // that is down does not front every attempt.
+                let lead_archive = if round % 2 == 0 { prefer_archive_r } else { !prefer_archive_r };
+                round += 1;
+                let wanted = missing.len() as u64;
                 for e in missing {
                     if sh.quiet.load(Ordering::Relaxed) {
                         break; // resume next hour; the window matters more
                     }
-                    let urls: Vec<String> = e.download_urls_for(prefer_archive_r);
-                    if urls.is_empty() {
-                        continue;
-                    }
+                    let urls: Vec<String> = e.download_urls_for(lead_archive);
                     let dest = config::file_path(&settings_r, &e.name);
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent).ok();
                     }
-                    match download::ensure_file(&cl, &urls, &dest, e.size).await {
+                    let mode = sh.source_mode.lock().unwrap().clone();
+                    #[cfg(feature = "seed")]
+                    let (outcome, via_swarm) =
+                        fetch_any(&cl, seeder_r.as_deref(), &mode, &e, &dest, &urls).await;
+                    #[cfg(not(feature = "seed"))]
+                    let (outcome, via_swarm) = {
+                        let _ = &mode;
+                        let o = if urls.is_empty() {
+                            Ok(download::Outcome::Failed)
+                        } else {
+                            download::ensure_file(&cl, &urls, &dest, e.size).await
+                        };
+                        (o, false)
+                    };
+                    if matches!(outcome, Ok(download::Outcome::Downloaded)) {
+                        if via_swarm {
+                            sh.swarm_files.fetch_add(1, Ordering::Relaxed);
+                            sh.swarm_bytes.fetch_add(e.size, Ordering::Relaxed);
+                        } else {
+                            sh.http_files.fetch_add(1, Ordering::Relaxed);
+                            sh.http_bytes.fetch_add(e.size, Ordering::Relaxed);
+                        }
+                    }
+                    match outcome {
                         Ok(download::Outcome::NoSpace) => {
                             if !sh.disk_full.swap(true, Ordering::Relaxed) {
-                                eprintln!("[disk] drive full — new downloads paused, seeding continues");
+                                eprintln!(
+                                    "[disk] drive full (or down to the {} kept free) — new downloads paused, seeding continues",
+                                    fmt_gb(download::keep_free())
+                                );
                             }
                             break;
                         }
@@ -2105,11 +2419,38 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                         sh.coverage_pct()
                     );
                 }
+                let still = wanted.saturating_sub(got);
+                if still > 0 && !sh.disk_full.load(Ordering::Relaxed) {
+                    idle_rounds = if got > 0 { 0 } else { idle_rounds + 1 };
+                    next_wait = match idle_rounds {
+                        0 => 120,
+                        1 => 300,
+                        2 => 900,
+                        3 => 1800,
+                        _ => config::MASTERLIST_REFRESH_SECS,
+                    };
+                    println!(
+                        "[retry] {still} file(s) still missing — every source again in {} min",
+                        next_wait / 60
+                    );
+                } else {
+                    idle_rounds = 0;
+                }
             }
         });
     }
 
     println!("[node] steady state — seeding + heartbeat + dashboard running. Ctrl-C to stop.");
+    // Ctrl-C in a terminal; SIGTERM from systemd or the menu's "Stop the node".
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c().await.ok();
     println!("\n[node] shutting down.");
     Ok(())

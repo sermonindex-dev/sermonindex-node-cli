@@ -16,7 +16,7 @@ const FULL = {
     uploaded_bytes: 1e9, reachable: 'open', quiet: false, disk_full: false,
     seed_granted: true, category: 'seed', source_mode: 'hybrid',
     swarm_files: 12, swarm_bytes: 1e8, http_files: 3, http_bytes: 2e7,
-    peers_in: 2, peers_out: 2, peers_in_peak: 5, v6_inbound_seen: false, available: true },
+    peers_in: 2, peers_out: 2, peers_in_peak: 5, v6_inbound_seen: false, available: true, update_available: '0.3.3' },
   system: { cpu_pct: 12, mem_used: 1e9, mem_total: 4e9, disk_used: 9e10, disk_total: 2e11,
     temp_c: 51, load: [0.5, 0.4, 0.3], os: 'Linux', arch: 'aarch64', hostname: 'pi' },
   trends: { traffic: [{ ts: now - 86400, inb: 10, out: 20 }, { ts: now, inb: 5, out: 8 }] },
@@ -60,6 +60,12 @@ async function runCase(label, payload) {
   }
   const src = w.document.getElementById('srcmode');
   out.push('srcmode="' + (src ? src.textContent : 'n/a') + '"');
+  // Update notice: shown exactly when /stats says a newer release exists.
+  const up = w.document.getElementById('updpill');
+  const wantUp = !!(payload.node && payload.node.update_available);
+  const shown = !!up && up.style.display !== 'none';
+  out.push('update=' + (shown ? '"' + up.textContent + '"' : 'hidden'));
+  if (shown !== wantUp) errors.push('update pill ' + (shown ? 'shown with no update' : 'missing for an available update'));
   w.close();
   return { label, out, errors };
 }

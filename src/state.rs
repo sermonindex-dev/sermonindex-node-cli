@@ -393,6 +393,8 @@ impl Shared {
 
         let node = json!({
             "available": true,
+            // So the kiosk can say "running v0.3.2" next to an update notice.
+            "version": env!("CARGO_PKG_VERSION"),
             // The port actually bound, not the constant (see Shared::listen_port).
             "port": match self.listen_port.load(Ordering::Relaxed) {
                 0 => config::LISTEN_PORT_START as u64,
@@ -400,6 +402,10 @@ impl Shared {
             },
             "peers": peers,
             "uptime_s": self.started.elapsed().as_secs(),
+            // So the menu can stop the node it is looking at, and knows to ask
+            // systemd (INVOCATION_ID is set for every unit) rather than signal it.
+            "pid": std::process::id(),
+            "service": std::env::var_os("INVOCATION_ID").is_some(),
             "coverage_pct": self.coverage_pct(),
             "held": held,
             "catalog": self.total.load(Ordering::Relaxed),

@@ -115,7 +115,7 @@ pub async fn fetch_verified(client: &reqwest::Client) -> Result<MasterList> {
 }
 
 /// Verify a detached ed25519 signature (base64 of 64 raw bytes) over `data`.
-fn verify(data: &[u8], sig_b64: &[u8]) -> Result<()> {
+pub(crate) fn verify(data: &[u8], sig_b64: &[u8]) -> Result<()> {
     let pk_bytes = base64::engine::general_purpose::STANDARD
         .decode(PUBKEY_B64)
         .context("decode pubkey")?;
