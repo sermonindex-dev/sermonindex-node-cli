@@ -240,6 +240,21 @@ async fn post_probe(client: &reqwest::Client, body: &Value) -> Option<(bool, boo
 }
 
 pub async fn probe_reachability(client: &reqwest::Client, port: u16) -> Option<bool> {
+    probe_detail(client, port).await.map(|p| p.v4 || p.v6)
+}
+
+/// What the reachability test found, in parts, for the menu's Connections page.
+#[derive(Clone, Copy, Debug)]
+pub struct Probe {
+    /// The test server dialled our public IPv4 address and got through.
+    pub v4: bool,
+    /// It dialled the IPv6 address we offered and got through.
+    pub v6: bool,
+    /// We had a global IPv6 address to offer at all.
+    pub v6_offered: bool,
+}
+
+pub async fn probe_detail(client: &reqwest::Client, port: u16) -> Option<Probe> {
     // Offer our global IPv6 (if any) so the edge can attempt the v6 dial — the
     // address a BitTorrent peer would actually use for global egress. The v6
     // list travels in the BODY, so a single request sent over IPv4 still gets
@@ -260,6 +275,7 @@ pub async fn probe_reachability(client: &reqwest::Client, port: u16) -> Option<b
     // Prefer the IPv4-pinned client so `open` is a real IPv4 measurement. Fall
     // back to the shared client on an IPv6-only host, where forcing IPv4 would
     // fail outright — there, `open` is judged against the v6 address as before.
+    let v6_offered = body.get("ipv6").is_some();
     let (open, open_v6) = match ipv4_client() {
         Some(c4) => match post_probe(&c4, &body).await {
             Some(r) => r,
@@ -267,7 +283,7 @@ pub async fn probe_reachability(client: &reqwest::Client, port: u16) -> Option<b
         },
         None => post_probe(client, &body).await?,
     };
-    Some(open || open_v6)
+    Some(Probe { v4: open, v6: open_v6, v6_offered })
 }
 
 /// Best-effort IP geolocation (city/region/country/lat/lon). Cached by caller.
@@ -330,6 +346,12 @@ pub async fn beat(
     seeded: Option<Value>,
 ) -> Option<Value> {
     let cov = shared.coverage_pct();
+    // Progress through the library this node SEEDS — only meaningful for an
+    // approved audio/full node. A picks node (or one waiting for approval)
+    // sends none, so the console does not show "100% seeded" for four sermons.
+    let seeding = (shared.scope == "audio" || shared.scope == "full")
+        && !shared.gated.load(Ordering::Relaxed);
+    let seed_pct = shared.scope_pct();
     let g = geo.clone().unwrap_or_else(|| json!({}));
     // node_type reflects the ADMIN grant only — never self-declared. The server
     // upsert overwrites node_type from this field each beat, so we must keep
@@ -359,9 +381,9 @@ pub async fn beat(
         // The node's OWN view of what it fetches. Reported so the console can
         // show what each node is really doing, not only what it was told.
         "content_mode": shared.source_mode.lock().unwrap().clone(),
-        "seed_scope": shared.scope,
-        "seed_progress": cov,
-        "seed_verified": cov >= 95.0,
+        "seed_scope": if seeding { shared.scope.as_str() } else { "" },
+        "seed_progress": if seeding { seed_pct } else { 0.0 },
+        "seed_verified": seeding && seed_pct >= 99.9,
         "library_coverage": cov,
         "files_stored": shared.held.load(Ordering::Relaxed),
         "storage_used_bytes": shared.storage_bytes.load(Ordering::Relaxed),

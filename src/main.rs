@@ -1238,6 +1238,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     }
 
     let shared = Arc::new(Shared::new(node_id.clone(), scope.clone()));
+    shared.gated.store(gated, Ordering::Relaxed);
     // Restore the IPv6 reachability proof from a previous run. It is a fact
     // about the past — a stranger on the internet once dialled this machine —
     // and a restart does not make it untrue.
@@ -1303,6 +1304,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         let cl = client.clone();
         tokio::spawn(async move {
             let geo = heartbeat::geo(&cl).await;
+            let mut test_now = false;
             loop {
                 // Probe the port the session REALLY bound, not the constant.
                 // `Seeder::start` walks 42800..=42839 for a free one; testing
@@ -1315,7 +1317,57 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     0 => config::LISTEN_PORT_START,
                     p => p as u16,
                 };
-                let probe = heartbeat::probe_reachability(&cl, port).await;
+                let forced = std::mem::take(&mut test_now);
+                if forced {
+                    println!("[test] testing whether other nodes can reach this one on port {port}…");
+                }
+                let detail = heartbeat::probe_detail(&cl, port).await;
+                let probe = detail.map(|p| p.v4 || p.v6);
+                *sh.probe.lock().unwrap() = serde_json::json!({
+                    "at": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    "port": port,
+                    "ran": detail.is_some(),
+                    "v4": detail.map(|p| p.v4),
+                    "v6": detail.and_then(|p| if p.v6_offered { Some(p.v6) } else { None }),
+                    "v6_offered": detail.map(|p| p.v6_offered).unwrap_or(false),
+                    "forced": forced,
+                });
+                if forced {
+                    match detail {
+                        None => println!("[test] the test server could not be reached — try again in a minute"),
+                        Some(d) => {
+                            println!(
+                                "[test] IPv4: port {port} is {}",
+                                if d.v4 { "OPEN — other nodes can connect to you" } else { "closed (normal behind most home routers)" }
+                            );
+                            if d.v6_offered {
+                                println!(
+                                    "[test] IPv6: {}",
+                                    if d.v6 {
+                                        "OPEN — other nodes can connect to you over IPv6"
+                                    } else {
+                                        "the test could not get through (the test server's IPv6 route is limited — a real IPv6 peer connecting in is the proof)"
+                                    }
+                                );
+                            } else {
+                                println!("[test] IPv6: this computer has no public IPv6 address right now");
+                            }
+                            if sh.v6_confirmed_recently() {
+                                println!("[test] IPv6: a peer HAS connected in over IPv6 recently — you are reachable");
+                            }
+                            if d.v6_offered && !d.v6 && !sh.v6_confirmed_recently() {
+                                let r = natpmp::try_v6_pinhole(port).await;
+                                println!("[test] IPv6 router: {r}");
+                                if let Some(o) = sh.probe.lock().unwrap().as_object_mut() {
+                                    o.insert("v6_router".into(), serde_json::json!(r));
+                                }
+                            }
+                        }
+                    }
+                }
                 // Passive proof outranks the probe. The probe can only ever test
                 // IPv4 (the edge has no outbound IPv6), so believing it alone
                 // files every CGNAT household as unreachable — which is most of
@@ -1419,7 +1471,19 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     0 => 300,
                     n => n,
                 };
-                tokio::time::sleep(Duration::from_secs(every)).await;
+                // Sleep in short slices so "Test my connection" in the menu
+                // (which leaves a test-connection flag) runs within seconds.
+                let flag = config::data_dir().join("test-connection");
+                let mut left = every * 2;
+                while left > 0 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    left -= 1;
+                    if flag.exists() {
+                        let _ = std::fs::remove_file(&flag);
+                        test_now = true;
+                        break;
+                    }
+                }
             }
         });
         let cl = client.clone();
@@ -1438,6 +1502,8 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     let entries: Vec<masterlist::Entry> =
         select_for(&ml, &scope, gated, &settings).into_iter().cloned().collect();
     shared.total.store(entries.len() as u64, Ordering::Relaxed);
+    shared.library_total.store(ml.entries.len() as u64, Ordering::Relaxed);
+    shared.library_bytes.store(ml.entries.values().map(|e| e.size).sum(), Ordering::Relaxed);
     println!("[scope] {} files in scope", entries.len());
 
     // Count what's already present, and (with seeding) start seeding it.
@@ -1632,11 +1698,20 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     let mut present_paths: Vec<(std::path::PathBuf, String)> = Vec::new();
     let mut present = 0u64;
     let mut present_bytes = 0u64;
-    for e in &entries {
+    let mut in_scope = 0u64;
+    // The WHOLE library, not just this node's scope: what it holds is what it
+    // reports and shares, whatever it set out to download. (A speaker taken
+    // off the picks list keeps being shared, and counted.)
+    let scope_ids: std::collections::HashSet<&str> = entries.iter().map(|e| e.id()).collect();
+    for e in ml.entries.values() {
         let p = config::file_path(&settings, &e.name);
         if download::file_ok(&p, e.size) {
             present += 1;
             present_bytes += e.size;
+            if scope_ids.contains(e.id()) {
+                in_scope += 1;
+                shared.scope_held.store(in_scope, Ordering::Relaxed);
+            }
             shared.held.store(present, Ordering::Relaxed); // report immediately while scanning
             // Keep the reported storage in step with the count as the scan runs,
             // so an early heartbeat during a long scan is never wildly low.
@@ -1646,7 +1721,13 @@ async fn run_daemon(args: &[String]) -> Result<()> {
         }
     }
     state::save_download_state(&dl_state);
-    println!("[library] {present}/{} already held ({:.1}% coverage)", entries.len(), shared.coverage_pct());
+    println!(
+        "[library] {present} of {} sermons in the library held ({:.1}% of the whole collection); {in_scope} of {} in this node's {} scope",
+        ml.entries.len(),
+        shared.coverage_pct(),
+        entries.len(),
+        scope
+    );
 
     // Register the already-present files for seeding in the BACKGROUND — re-hashing
     // thousands of files is slow and must not block the held count or downloads.
@@ -2062,6 +2143,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     }
                     if let Ok(download::Outcome::Downloaded) | Ok(download::Outcome::Skipped) = outcome {
                         let held = shared.held.fetch_add(1, Ordering::Relaxed) + 1;
+                        shared.scope_held.fetch_add(1, Ordering::Relaxed);
                         shared.storage_bytes.fetch_add(e.size, Ordering::Relaxed);
                         {
                             let mut ds = dl_state.lock().await;
@@ -2144,8 +2226,9 @@ async fn run_daemon(args: &[String]) -> Result<()> {
     {
         let sh = shared.clone();
         let settings_v = settings.clone();
+        // Every library file that is on disk counts, not only this scope's.
         let entries_v: Vec<(String, u64)> =
-            entries.iter().map(|e| (e.name.clone(), e.size)).collect();
+            ml.entries.values().map(|e| (e.name.clone(), e.size)).collect();
         tokio::spawn(async move {
             let stamp = config::data_dir().join("last-verify");
             loop {
@@ -2179,9 +2262,12 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     }
                 }
                 let _ = std::fs::write(&stamp, now.to_string());
-                if wrong > 0 || missing > 0 {
+                // `missing` counts the whole library, most of which a node may
+                // never have meant to hold — not a fault, so not reported.
+                let _ = missing;
+                if wrong > 0 {
                     println!(
-                        "[verify] weekly check — {ok} good, {wrong} WRONG SIZE, {missing} missing"
+                        "[verify] weekly check — {ok} good, {wrong} WRONG SIZE"
                     );
                     if wrong > 0 {
                         println!(
@@ -2190,7 +2276,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                         );
                     }
                 } else {
-                    println!("[verify] weekly check — all {ok} files present and correct");
+                    println!("[verify] weekly check — all {ok} files held are correct");
                 }
                 // Keep the reported figure honest after the sweep.
                 sh.held.store(ok, Ordering::Relaxed);
@@ -2314,6 +2400,8 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     .cloned()
                     .collect();
                 sh.total.store(all.len() as u64, Ordering::Relaxed);
+                sh.library_total.store(fresh.entries.len() as u64, Ordering::Relaxed);
+                sh.library_bytes.store(fresh.entries.values().map(|e| e.size).sum(), Ordering::Relaxed);
                 if fresh.version != known_version {
                     println!(
                         "[masterlist] v{known_version} -> v{} — {} files in scope",
@@ -2332,6 +2420,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                     })
                     .cloned()
                     .collect();
+                sh.scope_held.store((all.len() - missing.len()) as u64, Ordering::Relaxed);
                 if missing.is_empty() {
                     continue;
                 }
@@ -2397,6 +2486,7 @@ async fn run_daemon(args: &[String]) -> Result<()> {
                         }
                         Ok(download::Outcome::Downloaded) | Ok(download::Outcome::Skipped) => {
                             sh.held.fetch_add(1, Ordering::Relaxed);
+                            sh.scope_held.fetch_add(1, Ordering::Relaxed);
                             sh.storage_bytes.fetch_add(e.size, Ordering::Relaxed);
                             ds[e.id()] =
                                 serde_json::json!({ "downloaded": true, "diskSize": e.size });

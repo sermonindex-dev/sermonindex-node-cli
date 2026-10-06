@@ -15,8 +15,22 @@ pub struct Shared {
     pub node_id: String,
     pub started: Instant,
     pub scope: String,
+    /// Library files on disk — counted across the WHOLE master list, whatever
+    /// this node set out to hold. What it reports to the network.
     pub held: AtomicU64,
+    /// Files in this node's own scope (its picks, or the library it seeds).
     pub total: AtomicU64,
+    /// How many of `total` are on disk: the node's progress through its scope.
+    pub scope_held: AtomicU64,
+    /// The whole collection: every entry in the signed master list, and their
+    /// combined size. Coverage is measured against this, as the app does.
+    pub library_total: AtomicU64,
+    pub library_bytes: AtomicU64,
+    /// Asked to hold the library but not (yet) approved as a seed node.
+    pub gated: AtomicBool,
+    /// The last reachability test, for the menu's Connections page:
+    /// {at, port, v4, v6, v6_offered, forced}.
+    pub probe: Mutex<Value>,
     /// Real bytes on disk of everything this node currently holds — the sum of
     /// master-list entry sizes for files verified present at their signed size.
     /// This is what the heartbeat reports as `storage_used_bytes`; the admin
@@ -207,6 +221,11 @@ impl Shared {
             seed_up_bps: AtomicU64::new(0),
             reachable: AtomicU8::new(0),
             seed_granted: AtomicBool::new(false),
+            scope_held: AtomicU64::new(0),
+            library_total: AtomicU64::new(0),
+            library_bytes: AtomicU64::new(0),
+            gated: AtomicBool::new(false),
+            probe: Mutex::new(json!({})),
             downloading: AtomicBool::new(true),
             disk_full: AtomicBool::new(false),
             quiet: AtomicBool::new(false),
@@ -357,16 +376,35 @@ impl Shared {
         }
     }
 
+    /// How much of the WHOLE SermonIndex library this node holds, by size —
+    /// the same measure the desktop app reports as library_coverage. Until
+    /// 0.3.4 this was measured against the node's own scope, so a node that
+    /// picked four sermons and had two read 50%.
     pub fn coverage_pct(&self) -> f64 {
+        let total = self.library_bytes.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        let held = self.storage_bytes.load(Ordering::Relaxed) as f64;
+        // Two decimals: a node holding a few dozen sermons is a real 0.03%,
+        // not "0.0%".
+        let pct = ((held / total as f64) * 10_000.0).round() / 100.0;
+        // Never 100.0 while a file is missing: 40,030 of 40,042 rounds up to
+        // it, and "100%" on a kiosk or the console is a claim people act on.
+        let all_files = self.held.load(Ordering::Relaxed) >= self.library_total.load(Ordering::Relaxed);
+        if !all_files && pct >= 100.0 { 99.9 } else { pct.min(100.0) }
+    }
+
+    /// Progress through this node's own scope (its picks, or the library it
+    /// seeds), by file count.
+    pub fn scope_pct(&self) -> f64 {
         let total = self.total.load(Ordering::Relaxed);
         if total == 0 {
             return 0.0;
         }
-        let held = self.held.load(Ordering::Relaxed) as f64;
-        let pct = ((held / total as f64) * 1000.0).round() / 10.0;
-        // Never 100.0 while a file is missing: 40,030 of 40,042 rounds up to
-        // it, and "100%" on a kiosk or the console is a claim people act on.
-        if held < total as f64 && pct >= 100.0 { 99.9 } else { pct }
+        let held = self.scope_held.load(Ordering::Relaxed).min(total);
+        let pct = ((held as f64 / total as f64) * 1000.0).round() / 10.0;
+        if held < total && pct >= 100.0 { 99.9 } else { pct }
     }
 
     /// Rebuild the /stats JSON from a fresh system snapshot + counters + network.
@@ -406,9 +444,17 @@ impl Shared {
             // systemd (INVOCATION_ID is set for every unit) rather than signal it.
             "pid": std::process::id(),
             "service": std::env::var_os("INVOCATION_ID").is_some(),
+            // The whole library: what the network sees.
             "coverage_pct": self.coverage_pct(),
             "held": held,
-            "catalog": self.total.load(Ordering::Relaxed),
+            "catalog": self.library_total.load(Ordering::Relaxed),
+            // This node's own goal: its picks, or the library it seeds.
+            "scope": self.scope,
+            "scope_held": self.scope_held.load(Ordering::Relaxed),
+            "scope_total": self.total.load(Ordering::Relaxed),
+            "scope_pct": self.scope_pct(),
+            "gated": self.gated.load(Ordering::Relaxed),
+            "probe": self.probe.lock().unwrap().clone(),
             // Same figures the heartbeat sends, so the local dashboard and the
             // central admin can be compared directly when they disagree.
             "storage_bytes": self.storage_bytes.load(Ordering::Relaxed),
@@ -654,4 +700,25 @@ pub fn save_v6_proof(ts: u64) {
     let dir = config::data_dir();
     std::fs::create_dir_all(&dir).ok();
     let _ = std::fs::write(dir.join("v6-inbound"), ts.to_string());
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    /// Four sermons picked, two downloaded: 50% of the PICKS, but a sliver of
+    /// the library — and the library figure is what the network is told.
+    #[test]
+    fn coverage_is_of_the_whole_library_not_the_picks() {
+        let s = Shared::new("si-test".into(), "picks".into());
+        s.library_total.store(40_000, Ordering::Relaxed);
+        s.library_bytes.store(400_000_000_000, Ordering::Relaxed);
+        s.held.store(2, Ordering::Relaxed);
+        s.storage_bytes.store(40_000_000, Ordering::Relaxed);
+        s.total.store(4, Ordering::Relaxed);
+        s.scope_held.store(2, Ordering::Relaxed);
+        assert_eq!(s.scope_pct(), 50.0);
+        assert!(s.coverage_pct() < 0.1, "got {}", s.coverage_pct());
+        assert!(s.coverage_pct() > 0.0, "a real 0.01% must not round to nothing");
+    }
 }

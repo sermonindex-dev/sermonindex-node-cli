@@ -209,13 +209,18 @@ pub fn apply(s: &mut Value, key: &str, val: &str, notes: &mut Vec<String>) -> Re
         }
         "keep-free" => {
             if val.is_empty() {
-                bail!("give a size such as 20GB, or 'off'");
+                bail!("give a size such as 20GB (at least {}GB)", config::KEEP_FREE_MIN_GB);
             }
-            if val == "off" || val == "0" {
-                s["keep_free_gb"] = json!(0);
-            } else {
-                s["keep_free_gb"] = json!(parse_size_gb(val)?);
+            let gb = parse_size_gb(val).map_err(|_| {
+                anyhow::anyhow!("give a size such as 20GB (at least {}GB)", config::KEEP_FREE_MIN_GB)
+            })?;
+            if gb < config::KEEP_FREE_MIN_GB {
+                bail!(
+                    "keep at least {} GB free — a completely full drive stops the computer working properly",
+                    config::KEEP_FREE_MIN_GB
+                );
             }
+            s["keep_free_gb"] = json!(gb);
         }
         "reset" => {
             // Only the tuning knobs. node_id, storage_dir and quiet_hours are

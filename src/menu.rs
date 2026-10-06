@@ -554,6 +554,7 @@ enum Screen {
     Settings,
     Dashboard,
     Seed,
+    Connections,
     Updates,
     Help,
 }
@@ -561,6 +562,7 @@ enum Screen {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HomeAct {
     Seed,
+    Connections,
     Status,
     Speakers,
     Discover,
@@ -661,17 +663,16 @@ const SETTINGS: &[Setting] = &[
         unit: Unit::Plain },
     Setting { label: "Always keep free on the disk", key: "keep-free",
         kind: Kind::Preset(&[
-            ("5 GB", "5"),
+            ("5 GB — the least it will keep", "5"),
             ("10 GB (recommended)", "10"),
             ("25 GB", "25"),
             ("50 GB", "50"),
-            ("Nothing — the drive is only for sermons", "0"),
+            ("100 GB", "100"),
             ("Custom…", CUSTOM),
         ]),
         hint: "Downloads pause before the drive gets this full, so the rest of the computer keeps working.",
         custom: "Type how many gigabytes (GB) must always stay empty on the drive the sermons are on — \
-                 just the number.\n\nExample: 20 keeps 20 GB free for the computer itself.\n\
-                 Type 0 only if the drive holds nothing but the sermon library.",
+                 just the number, 5 or more.\n\nExample: 20 keeps 20 GB free for the computer itself.",
         unit: Unit::Plain },
     Setting { label: "Library folder", key: "dir", kind: Kind::Text,
         hint: "Where the sermons are stored. Choose a folder on a big drive.",
@@ -824,6 +825,10 @@ struct App {
     access_err: bool,
     seed_state: ListState,
     sending: bool,
+    conn_state: ListState,
+    /// A connection test in flight: when it was asked for, and the time of
+    /// the test result we had before (a newer one means it has answered).
+    testing: Option<(Instant, u64)>,
 }
 
 fn sel(i: usize) -> ListState {
@@ -883,6 +888,8 @@ impl App {
             access_err: false,
             seed_state: sel(0),
             sending: false,
+            conn_state: sel(0),
+            testing: None,
         }
     }
 
@@ -918,7 +925,20 @@ impl App {
 
     fn on_msg(&mut self, m: Msg) {
         match m {
-            Msg::Stats(s) => self.stats = s,
+            Msg::Stats(s) => {
+                self.stats = s;
+                if let Some((asked, before)) = self.testing {
+                    let at = self.probe_at();
+                    if at > before {
+                        self.testing = None;
+                        let m = self.probe_summary();
+                        self.say(m);
+                    } else if asked.elapsed() > Duration::from_secs(90) {
+                        self.testing = None;
+                        self.say("The test didn't report back — is the node still running? Try again in a minute.");
+                    }
+                }
+            }
             Msg::Held(h) => self.held = h,
             Msg::Catalog(Ok(c)) => {
                 self.catalog = Some(c);
@@ -1514,6 +1534,7 @@ impl App {
             Screen::Settings => self.keys_settings(k),
             Screen::Dashboard => self.keys_dashboard(k),
             Screen::Seed => self.keys_seed(k),
+            Screen::Connections => self.keys_conn(k),
             Screen::Updates => self.keys_updates(k),
             _ => {}
         }
@@ -1554,6 +1575,8 @@ impl App {
         let mut v = vec![
             (HomeAct::Status, "Node status".to_string(),
                 "What this node is doing right now: sharing, peers, how much of the library it holds, and how much memory it is using.".to_string()),
+            (HomeAct::Connections, "Connections".to_string(),
+                "How other nodes reach this one — IPv4 and IPv6, the router port, peers coming in and going out — and a test you can run now.".to_string()),
             (HomeAct::Speakers, "Speakers".to_string(),
                 format!("Browse every preacher and download all of one speaker's sermons. {cat_line}")),
             (HomeAct::Discover, "Discover".to_string(),
@@ -1638,6 +1661,10 @@ impl App {
                 HomeAct::MyPicks => self.push(Screen::MyPicks),
                 HomeAct::Scope => self.goto(HomeAct::Scope),
                 HomeAct::Seed => self.goto(HomeAct::Seed),
+                HomeAct::Connections => {
+                    self.conn_state.select(Some(0));
+                    self.push(Screen::Connections)
+                }
                 HomeAct::Settings => self.push(Screen::Settings),
                 HomeAct::Dashboard => {
                     self.dash_state.select(Some(0));
@@ -2057,6 +2084,220 @@ impl App {
         }
     }
 
+    fn probe(&self) -> Value {
+        self.stats.as_ref().map(|s| s["node"]["probe"].clone()).unwrap_or(Value::Null)
+    }
+
+    fn probe_at(&self) -> u64 {
+        self.probe()["at"].as_u64().unwrap_or(0)
+    }
+
+    /// One sentence for the footer when a test comes back.
+    fn probe_summary(&self) -> String {
+        let p = self.probe();
+        if p["ran"].as_bool() != Some(true) {
+            return "The test server couldn't be reached — try again in a minute.".into();
+        }
+        let v4 = p["v4"].as_bool() == Some(true);
+        let v6 = p["v6"].as_bool() == Some(true);
+        let seen = self.stats.as_ref().and_then(|s| s["node"]["v6_confirmed"].as_bool()).unwrap_or(false);
+        match (v4, v6 || seen) {
+            (true, true) => "Test done: other nodes can reach you over IPv4 and IPv6.".into(),
+            (true, false) => "Test done: other nodes can reach you over IPv4.".into(),
+            (false, true) => "Test done: IPv4 is closed, but other nodes can reach you over IPv6.".into(),
+            (false, false) => "Test done: other nodes can't connect in yet — see the steps on the Connections page.".into(),
+        }
+    }
+
+    fn conn_actions(&self) -> Vec<(u8, String)> {
+        let natpmp = config::natpmp_enabled(&self.settings);
+        vec![
+            (1, if self.testing.is_some() { "Testing…".into() } else { "Test my connection now".into() }),
+            (2, format!("Open my router port automatically: {}", if natpmp { "On" } else { "Off" })),
+            (9, "Back".into()),
+        ]
+    }
+
+    fn keys_conn(&mut self, k: KeyEvent) {
+        let acts = self.conn_actions();
+        let n = acts.len();
+        let i = self.conn_state.selected().unwrap_or(0).min(n - 1);
+        match k.code {
+            KeyCode::Up => self.conn_state.select(Some(if i == 0 { n - 1 } else { i - 1 })),
+            KeyCode::Down | KeyCode::Tab => self.conn_state.select(Some((i + 1) % n)),
+            KeyCode::Enter => match acts[i].0 {
+                1 => {
+                    if self.testing.is_some() {
+                        return;
+                    }
+                    if !self.running() {
+                        self.say("The test needs the node running — choose Start the node first.");
+                        return;
+                    }
+                    let _ = std::fs::create_dir_all(config::data_dir());
+                    match std::fs::write(config::data_dir().join("test-connection"), b"") {
+                        Ok(()) => {
+                            self.testing = Some((Instant::now(), self.probe_at()));
+                            self.say("Testing… a server on the internet is trying to connect to this node.");
+                        }
+                        Err(e) => self.say(format!("Could not start the test: {e}")),
+                    }
+                }
+                2 => {
+                    let on = config::natpmp_enabled(&self.settings);
+                    let _ = self.apply_setting("natpmp", if on { "off" } else { "on" });
+                }
+                _ => self.back(),
+            },
+            _ => {}
+        }
+    }
+
+    /// Everything the desktop app's Connections panel shows, as text.
+    fn draw_conn(&mut self, f: &mut Frame, area: Rect) {
+        let t = self.t;
+        let none = Color::Reset;
+        let kv = |k: &str, v: String, c: Color| {
+            Line::from(vec![Span::styled(format!("{k:<16}"), Style::new().fg(t.muted)), Span::styled(v, Style::new().fg(c))])
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ago = |at: u64| -> String {
+            let d = now.saturating_sub(at);
+            match d {
+                0..=89 => "just now".into(),
+                90..=5399 => format!("{} min ago", d / 60),
+                5400..=172_799 => format!("{} h ago", d / 3600),
+                _ => format!("{} days ago", d / 86_400),
+            }
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        let v6addr = crate::net::global_ipv6().map(|a| a.to_string());
+        match &self.stats {
+            None => {
+                lines.push(Line::styled("The node isn't running, so there is nothing to test yet.", Style::new().fg(t.gold)));
+                lines.push(Line::raw("Choose Start the node, then come back here."));
+                lines.push(Line::raw(""));
+                lines.push(kv("IPv6 address", v6addr.clone().unwrap_or_else(|| "none on this computer".into()), none));
+                lines.push(kv("This computer", self.lan.clone().unwrap_or_else(|| "—".into()), none));
+            }
+            Some(s) => {
+                let n = &s["node"];
+                let u = |k: &str| n[k].as_u64().unwrap_or(0);
+                let (what, col) = match n["category"].as_str().unwrap_or("") {
+                    "seed" => ("Seed node — approved, and other nodes can connect in", t.green),
+                    "node" => ("Node — other nodes can connect in", t.green),
+                    _ if n["reachable"].as_str() == Some("unknown") => ("Not tested yet", t.muted),
+                    _ => ("Peer — it connects out to others, but they can't connect in", t.gold),
+                };
+                lines.push(kv("This node is", what.into(), col));
+                let port = u("port");
+                let local = u("local_port");
+                let port_txt = if local != 0 && local != port {
+                    format!("{port} (TCP and UDP) — listening locally on {local}")
+                } else {
+                    format!("{port} (TCP and UDP)")
+                };
+                lines.push(kv("Port", port_txt, none));
+                lines.push(kv("This computer", self.lan.clone().unwrap_or_else(|| "—".into()), none));
+                lines.push(Line::raw(""));
+                let p = &n["probe"];
+                let tested = p["at"].as_u64().unwrap_or(0);
+                let when = if tested > 0 { format!("  (tested {})", ago(tested)) } else { String::new() };
+                let (v4, c4) = match (p["ran"].as_bool(), p["v4"].as_bool()) {
+                    (Some(true), Some(true)) => (format!("open ✓{when}"), t.green),
+                    (Some(true), Some(false)) => (format!("closed{when}"), t.gold),
+                    (Some(false), _) => (format!("test server unreachable{when}"), t.red),
+                    _ => ("not tested yet".into(), t.muted),
+                };
+                lines.push(kv("IPv4", v4, c4));
+                lines.push(kv("IPv6 address", v6addr.clone().unwrap_or_else(|| "none — IPv6 isn't available on this connection".into()), none));
+                let (v6t, c6) = match (p["ran"].as_bool(), p["v6"].as_bool()) {
+                    (Some(true), Some(true)) => ("open ✓".to_string(), t.green),
+                    (Some(true), Some(false)) => ("the test couldn't get through (its IPv6 reach is limited)".to_string(), t.muted),
+                    _ if v6addr.is_none() => ("—".into(), t.muted),
+                    _ => ("not tested yet".into(), t.muted),
+                };
+                lines.push(kv("IPv6 test", v6t, c6));
+                if let Some(r) = p["v6_router"].as_str() {
+                    lines.push(kv("IPv6 router", r.to_string(), if r.starts_with("the router opened") { t.green } else { t.muted }));
+                }
+                let seen_at = u("v6_inbound_at");
+                let (seen, cs) = if n["v6_confirmed"].as_bool() == Some(true) {
+                    (format!("a peer connected IN over IPv6 {} ✓ — reachable", if seen_at > 0 { ago(seen_at) } else { "recently".into() }), t.green)
+                } else if n["v6_inbound_seen"].as_bool() == Some(true) {
+                    (format!("last IPv6 peer connected in {}", ago(seen_at)), t.gold)
+                } else {
+                    ("no peer has connected in over IPv6 yet".into(), t.muted)
+                };
+                lines.push(kv("IPv6 proof", seen, cs));
+                lines.push(kv("Router", n["natpmp"].as_str().filter(|x| !x.is_empty()).unwrap_or("—").to_string(), none));
+                lines.push(Line::raw(""));
+                lines.push(kv(
+                    "Peers",
+                    format!(
+                        "{} connected · {} came to you · {} you reached · most at once coming in: {}",
+                        u("peers"),
+                        u("peers_in"),
+                        u("peers_out"),
+                        u("peers_in_peak")
+                    ),
+                    if u("peers") > 0 { t.green } else { none },
+                ));
+                lines.push(kv(
+                    "Finding peers",
+                    format!(
+                        "DHT {} · sharing {}",
+                        if config::dht_enabled(&self.settings) { "on" } else { "off" },
+                        if config::p2p_enabled(&self.settings) { "on" } else { "off" }
+                    ),
+                    none,
+                ));
+                lines.push(Line::raw(""));
+                let reachable = matches!(n["category"].as_str(), Some("seed") | Some("node"));
+                if reachable {
+                    lines.push(Line::styled("Other nodes can connect to this one. Nothing to do.", Style::new().fg(t.green)));
+                } else {
+                    lines.push(Line::styled("To let other nodes connect in:", Style::new().fg(t.gold).add_modifier(Modifier::BOLD)));
+                    lines.push(Line::raw(format!(
+                        "1. In your router, forward TCP and UDP port {port} to this computer{}.",
+                        self.lan.as_deref().map(|ip| format!(" ({ip})")).unwrap_or_default()
+                    )));
+                    if v6addr.is_some() {
+                        lines.push(Line::raw(format!(
+                            "2. For IPv6: in the router's IPv6 firewall, allow incoming TCP port {port} to this computer. \
+                             (No forwarding needed — IPv6 addresses are already public.)"
+                        )));
+                    }
+                    lines.push(Line::raw("Then choose Test my connection now. The node still shares with every peer it reaches either way."));
+                }
+            }
+        }
+        let inner_w = area.width.saturating_sub(4) as usize;
+        let rows: usize = lines
+            .iter()
+            .map(|l| wrap_count(&l.spans.iter().map(|s| s.content.as_ref()).collect::<String>(), inner_w))
+            .sum();
+        let n_act = self.conn_actions().len() as u16;
+        let h = (rows as u16 + 2).min(area.height.saturating_sub(n_act + 2).max(3));
+        let [info, list_area] = Layout::vertical([Constraint::Length(h), Constraint::Min(3)]).areas(area);
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(t.block("Connections").padding(ratatui::widgets::Padding::horizontal(1))),
+            info,
+        );
+        let items: Vec<ListItem> =
+            self.conn_actions().into_iter().map(|(_, l)| ListItem::new(format!(" {l}"))).collect();
+        f.render_stateful_widget(
+            List::new(items).block(t.block("")).highlight_style(t.hl()).highlight_symbol(t.g("▸", ">")),
+            list_area,
+            &mut self.conn_state,
+        );
+    }
+
     fn dash_actions(&self) -> Vec<(u8, String)> {
         vec![
             (1, "Open the dashboard in this computer's browser".into()),
@@ -2177,6 +2418,7 @@ impl App {
             Screen::Settings => self.draw_settings(f, body),
             Screen::Dashboard => self.draw_dashboard(f, body),
             Screen::Seed => self.draw_seed(f, body),
+            Screen::Connections => self.draw_conn(f, body),
             Screen::Updates => self.draw_updates(f, body),
             Screen::Help => self.draw_help(f, body),
         }
@@ -2384,13 +2626,34 @@ impl App {
                 );
                 lines.push(kv("Peers", peers, if u("peers") > 0 { t.green } else { none }));
                 lines.push(kv(
-                    "Holding",
+                    "Library held",
                     format!(
-                        "{} of {} files  ({:.1}%)",
+                        "{} of {} sermons  ({} of the whole collection)",
                         fmt_n(u("held")),
                         fmt_n(u("catalog")),
-                        n["coverage_pct"].as_f64().unwrap_or(0.0)
+                        fmt_pct(n["coverage_pct"].as_f64().unwrap_or(0.0))
                     ),
+                    none,
+                ));
+                let st = u("scope_total");
+                let goal = match n["scope"].as_str().unwrap_or("") {
+                    "audio" | "full" if n["gated"].as_bool() == Some(true) => "your picks (the library waits for seed approval)",
+                    "audio" => "the audio library",
+                    "full" => "the whole library",
+                    _ => "your picks",
+                };
+                lines.push(kv(
+                    "Downloading",
+                    if st == 0 {
+                        format!("{goal} — nothing chosen yet")
+                    } else {
+                        format!(
+                            "{goal}: {} of {} done  ({:.1}%)",
+                            fmt_n(u("scope_held")),
+                            fmt_n(st),
+                            n["scope_pct"].as_f64().unwrap_or(0.0)
+                        )
+                    },
                     none,
                 ));
                 lines.push(kv("On disk", fmt_bytes(u("storage_bytes")), none));
@@ -3469,13 +3732,7 @@ fn show_value(s: &Value, key: &str) -> String {
                 }
             }
         }
-        "keep-free" => {
-            if raw == "0" {
-                "Nothing — fills the drive".into()
-            } else {
-                format!("{raw} GB")
-            }
-        }
+        "keep-free" => format!("{raw} GB"),
         "window" => {
             if raw == "auto" {
                 format!("Automatic ({})", fmt_n(config::active_torrents(s) as u64))
@@ -3509,6 +3766,15 @@ fn show_value(s: &Value, key: &str) -> String {
         },
         "dir" => tidy_path(&config::downloads_dir(s)),
         _ => raw,
+    }
+}
+
+/// 0.03% stays 0.03%, 42.5% is 42.5%.
+fn fmt_pct(p: f64) -> String {
+    if p > 0.0 && p < 1.0 {
+        format!("{p:.2}%")
+    } else {
+        format!("{p:.1}%")
     }
 }
 
@@ -3663,7 +3929,7 @@ mod tests {
             for s in [
                 Screen::Home, Screen::Status, Screen::Speakers, Screen::Speaker(0), Screen::Sermons(1),
                 Screen::Discover, Screen::MyPicks, Screen::Scope, Screen::Settings, Screen::Dashboard,
-                Screen::Seed, Screen::Updates, Screen::Help,
+                Screen::Seed, Screen::Connections, Screen::Updates, Screen::Help,
             ] {
                 app.stack = vec![Screen::Home, s];
                 let _ = snapshot(&mut app, w, h);

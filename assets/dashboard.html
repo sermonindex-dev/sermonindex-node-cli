@@ -539,9 +539,15 @@ function render(){
     if(mapHtml!==LASTMAP){$('#p_map').innerHTML=mapHtml;LASTMAP=mapHtml;}
   }
   if(p==='net'){
-    var nodes=(nw.nodes||[]).slice().sort(function(a,b){return (b.sermons||0)-(a.sermons||0)}).slice(0,6);
+    /* Top nodes by library — and ALWAYS this one. A node with a handful of
+       sermons never made the top six, so the screen in the room did not show
+       the machine it was running on. If the network has not heard from this
+       node yet (first heartbeat is within five minutes of starting), say so. */
+    var all=(nw.nodes||[]).slice().sort(function(a,b){return (b.sermons||0)-(a.sermons||0)});
+    var nodes=all.slice(0,6),meIn=nodes.some(function(x){return x.self}),me=all.filter(function(x){return x.self})[0];
+    if(!meIn){nodes=nodes.slice(0,5);nodes.push(me||{self:true,sermons:n.held||0,pending:true,category:n.category});}
     var list=nodes.map(function(x){return '<div class="nrow"><span class="nd" style="background:'+catcol(x)+'"></span>'+
-      '<span class="nm">'+(x.self?'This node':(x.city||x.name||'node'))+'</span><span class="nc">'+(x.country||'')+'</span>'+
+      '<span class="nm">'+(x.self?(x.pending?'This node · joining':'This node'):(x.city||x.name||'node'))+'</span><span class="nc">'+(x.country||'')+'</span>'+
       '<span class="nv">'+fn(x.sermons)+'</span></div>'}).join('');
     $('#p_net').innerHTML=
      '<div class="col" style="height:100%">'+
@@ -561,10 +567,10 @@ function render(){
     $('#p_node').innerHTML=
      '<div class="col" style="height:100%">'+
        '<div class="row" style="flex:1;min-height:0">'+
-         '<div class="card gaugewrap" style="width:200px">'+gauge(cov,'coverage',(cov?cov.toFixed(cov<10?1:0):'0')+'%','--goldtext')+'</div>'+
+         '<div class="card gaugewrap" style="width:200px">'+gauge(cov,'coverage',(cov?cov.toFixed(cov<1?2:cov<10?1:0):'0')+'%','--goldtext')+'</div>'+
          '<div class="col" style="flex:1;min-height:0">'+
            '<div class="tiles">'+
-             '<div class="card"><div class="lbl">Sermons held</div><div class="big">'+fn(n.held)+'</div><div class="sm">of '+fn(n.catalog||'—')+' in catalog</div></div>'+
+             '<div class="card"><div class="lbl">Sermons held</div><div class="big">'+fn(n.held)+'</div><div class="sm">of '+fn(n.catalog||'—')+' in the library</div></div>'+
              '<div class="card"><div class="lbl">Peers served</div><div class="big" style="color:var(--dirin)">'+fn(n.peers_in_peak!=null?n.peers_in_peak:n.peers)+'</div><div class="sm">came to you · '+fn(n.peers)+' connected now</div></div>'+
              '<div class="card"><div class="lbl">Uploading</div><div class="big" style="color:var(--seedblue)">'+fbps(sy.up_bps)+'</div><div class="sm">to the swarm</div></div>'+
              '<div class="card"><div class="lbl">Library size</div><div class="big">'+fb(n.storage_bytes||sy.disk_used)+'</div><div class="sm">uptime '+fdur(n.uptime_s)+'</div></div>'+

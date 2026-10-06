@@ -304,3 +304,59 @@ pub fn spawn(
         }
     });
 }
+
+
+/// Ask the router to open an IPv6 pinhole for `port` (PCP over IPv6), as part
+/// of "Test my connection". An IPv6 address is already public — nothing needs
+/// forwarding — but most routers firewall incoming IPv6 by default, and a few
+/// let a device open a hole with PCP. Returns a sentence for the log and the
+/// Connections page. Best effort: most home routers will say no or not answer.
+pub async fn try_v6_pinhole(port: u16) -> String {
+    let Some(me) = crate::net::global_ipv6() else {
+        return "no public IPv6 address on this computer".into();
+    };
+    let Some(gw) = ipv6_gateway() else {
+        return "could not find the router's IPv6 address".into();
+    };
+    if (gw.segments()[0] & 0xffc0) == 0xfe80 {
+        // A link-local gateway needs an interface scope the PCP library cannot
+        // carry, so asking would only fail. Say so rather than pretend.
+        return "the router only offers a link-local IPv6 address, so it can't be asked automatically \
+                — allow incoming TCP on this port in its IPv6 firewall"
+            .into();
+    }
+    match crab_nat::try_port_mapping(
+        IpAddr::V6(gw),
+        IpAddr::V6(me),
+        crab_nat::InternetProtocol::Tcp,
+        port,
+        Some(port),
+        Some(7200),
+    )
+    .await
+    {
+        Ok(m) => {
+            std::mem::forget(m);
+            format!("the router opened IPv6 port {port} for this computer")
+        }
+        Err(_) => "the router did not agree to open IPv6 automatically (most don't) — allow incoming TCP on this port in its IPv6 firewall".into(),
+    }
+}
+
+fn ipv6_gateway() -> Option<std::net::Ipv6Addr> {
+    let out = if cfg!(target_os = "macos") {
+        std::process::Command::new("route").args(["-n", "get", "-inet6", "default"]).output().ok()?
+    } else {
+        std::process::Command::new("ip").args(["-6", "route", "show", "default"]).output().ok()?
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut words = text.split_whitespace();
+    while let Some(w) = words.next() {
+        if w == "via" || w == "gateway:" {
+            let g = words.next()?;
+            let g = g.split('%').next()?;
+            return g.parse().ok();
+        }
+    }
+    None
+}

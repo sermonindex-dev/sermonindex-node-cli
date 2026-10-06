@@ -638,9 +638,15 @@ pub fn source_mode_names(mode: &str) -> (&'static str, &'static str) {
 /// Space the node leaves free on the library's drive (default 10 GB), so a
 /// node on someone's everyday computer stops downloading before the desktop,
 /// the browser and the system updates run out of room. Settings key
-/// `keep_free_gb`; 0 lets it fill the drive (a dedicated library disk).
+/// `keep_free_gb`, never less than KEEP_FREE_MIN_GB: a drive filled to the last
+/// byte breaks the computer it is in (and the node's own logs and state).
+pub const KEEP_FREE_MIN_GB: f64 = 5.0;
 pub fn keep_free_bytes(settings: &Value) -> u64 {
-    let gb = settings.get("keep_free_gb").and_then(|v| v.as_f64()).unwrap_or(10.0).max(0.0);
+    let gb = settings
+        .get("keep_free_gb")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10.0)
+        .max(KEEP_FREE_MIN_GB);
     (gb * 1024.0 * 1024.0 * 1024.0) as u64
 }
 
